@@ -3,6 +3,10 @@
 #include "SdlGfxDevice.h"
 #include "../Graphics/ITextureLoader.h"
 
+#if defined(WITH_RHI_GXM)
+#	include "../Application.h"
+#endif
+
 #include "../Graphics/RHI/Rhi.h"
 
 #if defined(WITH_RHI_D3D11) && defined(WITH_SDL2)
@@ -350,6 +354,20 @@ namespace nCine::Backends
 			resizeSoftwareTarget(_drawableWidth, _drawableHeight);
 #	endif
 		}
+#endif
+	}
+
+	void SdlGfxDevice::setDrawableSize(int width, int height)
+	{
+#if defined(WITH_RHI_GXM)
+		if (RHI::Device::ResizeScreenSurface(width, height)) {
+			_drawableWidth = RHI::Device::GetScreenWidth();
+			_drawableHeight = RHI::Device::GetScreenHeight();
+			theApplication().ResizeScreenViewport(_drawableWidth, _drawableHeight);
+		}
+#else
+		static_cast<void>(width);
+		static_cast<void>(height);
 #endif
 	}
 

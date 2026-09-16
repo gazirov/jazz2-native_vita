@@ -9,13 +9,11 @@
 namespace nCine::RHI::GXM
 {
 	GxmRenderTarget::GxmRenderTarget()
-		: _numDrawBuffers(MaxColorAttachments), _gxmRenderTarget(nullptr), _syncObject(nullptr), _surfaceTexture(nullptr),
-			_surfaceData(nullptr), _surfaceWidth(0), _surfaceHeight(0), _surfaceValid(false)
+		: _numDrawBuffers(MaxColorAttachments), _gxmRenderTarget(nullptr), _surfaceTexture(nullptr)
 	{
 		for (std::uint32_t i = 0; i < MaxColorAttachments; i++) {
 			_colorTextures[i] = nullptr;
 		}
-		std::memset(&_colorSurface, 0, sizeof(_colorSurface));
 	}
 
 	GxmRenderTarget::~GxmRenderTarget()
@@ -44,15 +42,13 @@ namespace nCine::RHI::GXM
 			sceGxmDestroyRenderTarget(_gxmRenderTarget);
 			_gxmRenderTarget = nullptr;
 		}
-		if (_syncObject != nullptr) {
-			sceGxmSyncObjectDestroy(_syncObject);
-			_syncObject = nullptr;
+		for (SurfaceSlot& slot : _surfaceSlots) {
+			if (slot.SyncObject != nullptr) {
+				sceGxmSyncObjectDestroy(slot.SyncObject);
+			}
+			slot = {};
 		}
-		_surfaceValid = false;
 		_surfaceTexture = nullptr;
-		_surfaceData = nullptr;
-		_surfaceWidth = 0;
-		_surfaceHeight = 0;
 	}
 
 	void GxmRenderTarget::AttachColorTexture(GxmTexture& texture, std::uint32_t index)
@@ -132,7 +128,7 @@ namespace nCine::RHI::GXM
 
 	void GxmRenderTarget::SetObjectLabel(StringView label)
 	{
-		static_cast<void>(label);
+		_label = label;
 	}
 
 	bool GxmRenderTarget::GetSceneTarget(SceGxmRenderTarget*& renderTarget, SceGxmColorSurface*& colorSurface,
@@ -143,6 +139,7 @@ namespace nCine::RHI::GXM
 			return false;
 		}
 
+		SurfaceSlot& slot = _surfaceSlots[0];
 		void* surfaceData = texture->GetSurfaceData();
 		if (surfaceData == nullptr) {
 			return false;
@@ -150,8 +147,8 @@ namespace nCine::RHI::GXM
 
 		// Rebuild when the attachment, its size or its GPU allocation changed under us (an upload that
 		// resizes the texture reallocates the block the surface points at)
-		if (_surfaceValid && (_surfaceTexture != texture || _surfaceData != surfaceData ||
-				_surfaceWidth != texture->GetWidth() || _surfaceHeight != texture->GetHeight())) {
+		if (slot.Valid && (_surfaceTexture != texture || slot.SurfaceData != surfaceData ||
+				slot.Width != texture->GetWidth() || slot.Height != texture->GetHeight())) {
 			ReleaseSceneTarget();
 			surfaceData = texture->GetSurfaceData();
 			if (surfaceData == nullptr) {
@@ -159,7 +156,7 @@ namespace nCine::RHI::GXM
 			}
 		}
 
-		if (!_surfaceValid) {
+		if (!slot.Valid) {
 			const std::int32_t targetWidth = texture->GetWidth();
 			const std::int32_t targetHeight = texture->GetHeight();
 			if (targetWidth <= 0 || targetHeight <= 0) {
@@ -177,21 +174,24 @@ namespace nCine::RHI::GXM
 			params.multisampleLocations = 0;
 			params.driverMemBlock = GxmMemory::InvalidUid;
 
-			std::int32_t result = sceGxmSyncObjectCreate(&_syncObject);
+			std::int32_t result = sceGxmSyncObjectCreate(&slot.SyncObject);
 			if (result < 0) {
 				LOGE("sceGxmSyncObjectCreate() for a {}x{} render target failed with 0x{:.8x}",
 					targetWidth, targetHeight, std::uint32_t(result));
-				_syncObject = nullptr;
+				slot.SyncObject = nullptr;
 				return false;
 			}
 
-			result = sceGxmCreateRenderTarget(&params, &_gxmRenderTarget);
-			if (result < 0) {
-				LOGE("sceGxmCreateRenderTarget({}x{}) failed with 0x{:.8x}", targetWidth, targetHeight, std::uint32_t(result));
-				_gxmRenderTarget = nullptr;
-				sceGxmSyncObjectDestroy(_syncObject);
-				_syncObject = nullptr;
-				return false;
+			const bool createdRenderTarget = (_gxmRenderTarget == nullptr);
+			if (createdRenderTarget) {
+				result = sceGxmCreateRenderTarget(&params, &_gxmRenderTarget);
+				if (result < 0) {
+					LOGE("sceGxmCreateRenderTarget({}x{}) failed with 0x{:.8x}", targetWidth, targetHeight, std::uint32_t(result));
+					_gxmRenderTarget = nullptr;
+					sceGxmSyncObjectDestroy(slot.SyncObject);
+					slot.SyncObject = nullptr;
+					return false;
+				}
 			}
 
 			// The colour surface's stride is the texture's own row pitch, so the GPU renders straight into the
@@ -199,30 +199,32 @@ namespace nCine::RHI::GXM
 			// Tiled, to match the layout the attachment's texture describes (see GxmTexture::EnsureGpuTexture()):
 			// a linear texture cannot sample outside [0, 1], and every one of these targets is later read by a
 			// pass that does. The stride is the tile-padded width the texture allocated.
-			result = sceGxmColorSurfaceInit(&_colorSurface, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
+			result = sceGxmColorSurfaceInit(&slot.ColorSurface, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
 				SCE_GXM_COLOR_SURFACE_TILED, SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
 				std::uint32_t(targetWidth), std::uint32_t(targetHeight), texture->GetSurfaceStride() / 4u, surfaceData);
 			if (result < 0) {
 				LOGE("sceGxmColorSurfaceInit({}x{}) failed with 0x{:.8x}", targetWidth, targetHeight, std::uint32_t(result));
-				sceGxmDestroyRenderTarget(_gxmRenderTarget);
-				_gxmRenderTarget = nullptr;
-				sceGxmSyncObjectDestroy(_syncObject);
-				_syncObject = nullptr;
+				if (createdRenderTarget) {
+					sceGxmDestroyRenderTarget(_gxmRenderTarget);
+					_gxmRenderTarget = nullptr;
+				}
+				sceGxmSyncObjectDestroy(slot.SyncObject);
+				slot.SyncObject = nullptr;
 				return false;
 			}
 
 			_surfaceTexture = texture;
-			_surfaceData = surfaceData;
-			_surfaceWidth = targetWidth;
-			_surfaceHeight = targetHeight;
-			_surfaceValid = true;
+			slot.SurfaceData = surfaceData;
+			slot.Width = targetWidth;
+			slot.Height = targetHeight;
+			slot.Valid = true;
 		}
 
 		renderTarget = _gxmRenderTarget;
-		colorSurface = &_colorSurface;
-		syncObject = _syncObject;
-		width = _surfaceWidth;
-		height = _surfaceHeight;
+		colorSurface = &slot.ColorSurface;
+		syncObject = slot.SyncObject;
+		width = slot.Width;
+		height = slot.Height;
 		return true;
 	}
 }

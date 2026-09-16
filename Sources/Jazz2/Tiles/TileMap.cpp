@@ -8,6 +8,9 @@
 #include "../../nCine/Graphics/RenderQueue.h"
 #include "../../nCine/Graphics/RenderResources.h"
 #include "../../nCine/Graphics/RenderBuffersManager.h"
+#if defined(DEATH_TARGET_VITA)
+#	include "../../nCine/Graphics/RHI/GXM/GxmDevice.h"
+#endif
 
 #include <Containers/GrowableArray.h>
 
@@ -1133,7 +1136,6 @@ namespace Jazz2::Tiles
 						continue;
 					}
 
-#if defined(TILEMAP_USE_SINGLE_DRAW)
 					// Which texture chunk holds this tile. Has to be read BEFORE ResolveTextureDiffuse(), which
 					// takes the ID by reference and rebases it into that chunk - afterwards the ID is always
 					// below TilesPerTexture and this would collapse to chunk 0, drawing the whole layer out of
@@ -1141,11 +1143,20 @@ namespace Jazz2::Tiles
 					// limit small enough to split the tileset atlas (the consoles) makes it matter.
 					const std::int32_t tileChunk = (tileSet->TilesPerTexture > 0 && tileId >= tileSet->TilesPerTexture
 						? tileId / tileSet->TilesPerTexture : 0);
-#endif
 					Texture* tileTexture = tileSet->ResolveTextureDiffuse(tileId);
 					if DEATH_UNLIKELY(tileTexture == nullptr) {
 						continue;
 					}
+					bool tileIndexed = tileSet->IsIndexed;
+#if defined(DEATH_TARGET_VITA)
+					if (tileIndexed) {
+						// Expand the atlas once per palette row so every tile fragment uses the ordinary one-sample shader.
+						if (Texture* bakedTexture = tileSet->GetBakedDiffuse(tileChunk, 0, ContentResolver::Get().GetPalettes())) {
+							tileTexture = bakedTexture;
+							tileIndexed = false;
+						}
+					}
+#endif
 
 					Vector2i texSize = tileTexture->GetSize();
 					float texScaleX = TileSet::DefaultTileSize / float(texSize.X);
@@ -1183,7 +1194,7 @@ namespace Jazz2::Tiles
 #endif
 
 					TileCommandUniforms* commandUniforms;
-					auto command = RentRenderCommand(rendererType, tileSet->IsIndexed, &commandUniforms);
+					auto command = RentRenderCommand(rendererType, tileIndexed, &commandUniforms);
 					command->SetType(RenderCommand::Type::TileMap);
 					command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
 
@@ -1200,7 +1211,7 @@ namespace Jazz2::Tiles
 					// indexed. Open-coded rather than through ContentResolver::BindSpritePalette() so the palette
 					// offset goes through the cached uniform instead of a by-name lookup per tile.
 					command->GetMaterial().SetTexture(0, *tileTexture);
-					if (tileSet->IsIndexed) {
+					if (tileIndexed) {
 						Texture* paletteTexture = ContentResolver::Get().GetPaletteTexture();
 						if (paletteTexture != nullptr) {
 							command->GetMaterial().SetTexture(1, *paletteTexture);
@@ -1226,8 +1237,20 @@ namespace Jazz2::Tiles
 					}
 					// Tiles use the default sprite palette (row 0, offset 0); every tile accumulated into these
 					// vertices resolved to this chunk of the tileset atlas
-					EmitMesh(renderQueue, _meshVertices[verticesIndex], *meshTileSet->TextureDiffuse[chunk],
-						meshTileSet->IsIndexed, 0, layerColor, layer.Description.Depth, RenderCommand::Type::TileMap, false);
+					Texture* texture = meshTileSet->TextureDiffuse[chunk].get();
+					bool indexed = meshTileSet->IsIndexed;
+#if defined(DEATH_TARGET_VITA)
+					if (indexed) {
+						if (Texture* bakedTexture = meshTileSet->GetBakedDiffuse(chunk, 0, ContentResolver::Get().GetPalettes())) {
+							texture = bakedTexture;
+							indexed = false;
+						}
+					}
+#endif
+					if (texture != nullptr) {
+						EmitMesh(renderQueue, _meshVertices[verticesIndex], *texture, indexed, 0, layerColor,
+							layer.Description.Depth, RenderCommand::Type::TileMap, false);
+					}
 				}
 			}
 #endif
@@ -1404,6 +1427,12 @@ namespace Jazz2::Tiles
 			RenderCommand* command = _meshCommands[_meshCommandCount++].get();
 
 			command->SetType(type);
+#if defined(DEATH_TARGET_VITA)
+			// The palette shader is shared by layers and debris; distinguish their GPU cost in Vita telemetry.
+			command->SetTelemetryLabel(type == RenderCommand::Type::Particle
+				? (indexed ? "TileDebrisMeshPalette" : "TileDebrisMesh")
+				: (indexed ? "TileMapMeshPalette" : "TileMapMesh"));
+#endif
 			command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha,
 				additiveBlending ? BlendingFactor::One : BlendingFactor::OneMinusSrcAlpha);
 

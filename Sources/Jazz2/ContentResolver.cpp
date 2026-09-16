@@ -1335,11 +1335,18 @@ namespace Jazz2
 		std::unique_ptr<std::uint8_t[]> tileDiffuseOpaque;
 		// Whether tiles keep raw palette indices (recolored at draw time) vs baked colors; set by BuildTilesetDiffuse()
 		bool indexTiles = false;
+	#if defined(DEATH_TARGET_VITA)
+		SmallVector<Array<std::uint8_t>, 1> indexedDiffuseTexels;
+	#endif
 
 		// The image content follows the compressed block, so it's read from the raw stream (headless builds masks only)
 		if (!_isHeadless) {
 			textureDiffuse = BuildTilesetDiffuse(s, fullPath.data(), channelCount, width, height, tileCount,
-				is32bitTile.get(), paletteRemapping, captionTileId, indexTiles, tileDiffuseOpaque, captionTile);
+				is32bitTile.get(), paletteRemapping, captionTileId, indexTiles, tileDiffuseOpaque, captionTile
+	#if defined(DEATH_TARGET_VITA)
+				, indexedDiffuseTexels
+	#endif
+			);
 		}
 
 		if (!uc.IsValid()) {
@@ -1348,7 +1355,11 @@ namespace Jazz2
 
 		auto tileSet = std::make_unique<Tiles::TileSet>(path,
 			tileCount, Death::move(textureDiffuse), Death::move(mask),
-			maskSize, Death::move(captionTile), tileDiffuseOpaque.get());
+			maskSize, Death::move(captionTile), tileDiffuseOpaque.get()
+	#if defined(DEATH_TARGET_VITA)
+			, Death::move(indexedDiffuseTexels)
+	#endif
+			);
 		tileSet->IsIndexed = indexTiles;
 		return tileSet;
 	}
@@ -1395,7 +1406,11 @@ namespace Jazz2
 	SmallVector<std::unique_ptr<Texture>, 1> ContentResolver::BuildTilesetDiffuse(std::unique_ptr<Stream>& s, const char* name, std::uint8_t channelCount,
 		std::uint32_t width, std::uint32_t height, std::uint16_t tileCount, const std::uint8_t* is32bitTile,
 		const std::uint8_t* paletteRemapping, std::uint16_t captionTileId, bool& indexTiles,
-		std::unique_ptr<std::uint8_t[]>& tileDiffuseOpaque, std::unique_ptr<Color[]>& captionTile)
+		std::unique_ptr<std::uint8_t[]>& tileDiffuseOpaque, std::unique_ptr<Color[]>& captionTile
+#if defined(DEATH_TARGET_VITA)
+		, SmallVector<Array<std::uint8_t>, 1>& indexedDiffuseTexels
+#endif
+		)
 	{
 		// 32-bit (true-color) tiles have no palette index, so a tileset containing any must stay baked as RGBA;
 		// an all-8-bit tileset keeps raw palette indices and recolors at draw time (uploaded as R8).
@@ -1569,6 +1584,11 @@ namespace Jazz2
 			if (indexTiles) {
 				// Index 0 is the transparent palette entry (row 0), so this uploads directly as R8 (no per-pixel alpha)
 				textureDiffuse = CreateIndexedTexture(name, chunkBase, paddedWidth, chunkHeight, 1, paletteBaseTransparent);
+	#if defined(DEATH_TARGET_VITA)
+				Array<std::uint8_t> texels(NoInit, std::size_t(paddedWidth) * chunkHeight);
+				std::memcpy(texels.data(), chunkBase, texels.size());
+				indexedDiffuseTexels.push_back(Death::move(texels));
+	#endif
 			} else {
 				textureDiffuse = std::make_unique<Texture>(name, Texture::Format::RGBA8, paddedWidth, chunkHeight);
 				textureDiffuse->LoadFromTexels(chunkBase, 0, 0, paddedWidth, chunkHeight);

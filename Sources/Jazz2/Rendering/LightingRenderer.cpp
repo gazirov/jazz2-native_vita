@@ -5,6 +5,9 @@
 #include "../../nCine/Graphics/RenderQueue.h"
 #include "../../nCine/Graphics/RenderResources.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace Jazz2::Rendering
 {
 #if defined(RHI_CAP_SHADERS) && defined(RHI_CAP_FRAMEBUFFERS)
@@ -39,7 +42,6 @@ namespace Jazz2::Rendering
 		for (std::size_t i = 0; i < actorsCount; i++) {
 			actors[i]->OnEmitLights(_emittedLightsCache);
 		}
-
 		// Every actor in the level emits, wherever it is, and in splitscreen each viewport collects the same set,
 		// so a light whose circle cannot reach this view is dropped before it costs any geometry. Nothing else
 		// culls them: the render queue only culls drawable nodes, and these are raw commands.
@@ -48,6 +50,19 @@ namespace Jazz2::Rendering
 		const float cullMinY = cullingRect.Y, cullMaxY = cullingRect.Y + cullingRect.H;
 
 		_vertices.clear();
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		// A dense chain of animated fire objects can otherwise submit hundreds of overlapping additive quads.
+		// Keep the brightest nearby lights, merge neighbours, then enforce a fixed per-viewport GPU budget.
+		constexpr std::uint32_t MaxLightsForMerge = 128;
+		constexpr std::uint32_t MaxVisibleLights = 64;
+		struct RankedLight {
+			LightEmitter Light;
+			float Score;
+		};
+		SmallVector<RankedLight, 0> candidates;
+		const float centerX = (cullMinX + cullMaxX) * 0.5f;
+		const float centerY = (cullMinY + cullMaxY) * 0.5f;
+		const float viewRadiusSq = (cullingRect.W * cullingRect.W + cullingRect.H * cullingRect.H) * 0.25f;
 		for (auto& light : _emittedLightsCache) {
 			// A light with no far radius covers no pixels at all (the quad the shader path built for it was
 			// zero-sized), and its normalized near radius would divide by zero
@@ -59,8 +74,67 @@ namespace Jazz2::Rendering
 				continue;
 			}
 
+			const float dx = light.Pos.X - centerX;
+			const float dy = light.Pos.Y - centerY;
+			const float proximity = 1.0f / (1.0f + (dx * dx + dy * dy) / std::max(viewRadiusSq, 1.0f));
+			candidates.push_back({light, std::max(light.Intensity * light.Brightness * light.RadiusFar, 0.0f) * proximity});
+		}
+		std::sort(candidates.begin(), candidates.end(), [](const RankedLight& a, const RankedLight& b) {
+			return (a.Light.IsPlayerLight != b.Light.IsPlayerLight ? a.Light.IsPlayerLight : a.Score > b.Score);
+		});
+		if (candidates.size() > MaxLightsForMerge) {
+			candidates.resize(MaxLightsForMerge);
+		}
+		SmallVector<LightEmitter, 0> budgetedLights;
+		for (const RankedLight& candidate : candidates) {
+			bool merged = false;
+			for (LightEmitter& existing : budgetedLights) {
+				if (existing.IsPlayerLight != candidate.Light.IsPlayerLight) {
+					continue;
+				}
+				const float mergeDistance = (existing.RadiusFar + candidate.Light.RadiusFar) * 0.5f;
+				const float dx = existing.Pos.X - candidate.Light.Pos.X;
+				const float dy = existing.Pos.Y - candidate.Light.Pos.Y;
+				if (dx * dx + dy * dy > mergeDistance * mergeDistance) {
+					continue;
+				}
+
+				const float existingWeight = std::max(existing.Intensity * existing.Brightness * existing.RadiusFar, 0.01f);
+				const float candidateWeight = std::max(candidate.Light.Intensity * candidate.Light.Brightness * candidate.Light.RadiusFar, 0.01f);
+				const Vector2f existingPos = existing.Pos;
+				existing.Pos = (existingPos * existingWeight + candidate.Light.Pos * candidateWeight) / (existingWeight + candidateWeight);
+				// Moving the centre without expanding the radius cuts off the original cubic falloff and makes
+				// merged fire lights look like hard-edged patches. Keep both source circles fully covered.
+				const float existingDistance = std::sqrt((existingPos.X - existing.Pos.X) * (existingPos.X - existing.Pos.X) +
+					(existingPos.Y - existing.Pos.Y) * (existingPos.Y - existing.Pos.Y));
+				const float candidateDistance = std::sqrt((candidate.Light.Pos.X - existing.Pos.X) * (candidate.Light.Pos.X - existing.Pos.X) +
+					(candidate.Light.Pos.Y - existing.Pos.Y) * (candidate.Light.Pos.Y - existing.Pos.Y));
+				existing.Intensity = std::max(existing.Intensity, candidate.Light.Intensity);
+				existing.Brightness = std::max(existing.Brightness, candidate.Light.Brightness);
+				existing.RadiusNear = std::min(existing.RadiusNear, candidate.Light.RadiusNear);
+				existing.RadiusFar = std::max(existing.RadiusFar + existingDistance, candidate.Light.RadiusFar + candidateDistance);
+				merged = true;
+				break;
+			}
+			if (!merged) {
+				if (budgetedLights.size() < MaxVisibleLights) {
+					budgetedLights.push_back(candidate.Light);
+				} else {
+				}
+			}
+		}
+		for (const LightEmitter& light : budgetedLights) {
 			AppendLightQuad(light);
 		}
+#else
+		for (auto& light : _emittedLightsCache) {
+			if (light.RadiusFar <= 0.0f || light.Pos.X + light.RadiusFar <= cullMinX || light.Pos.X - light.RadiusFar >= cullMaxX ||
+				light.Pos.Y + light.RadiusFar <= cullMinY || light.Pos.Y - light.RadiusFar >= cullMaxY) {
+				continue;
+			}
+			AppendLightQuad(light);
+		}
+#endif
 
 		if (_vertices.empty()) {
 			return true;

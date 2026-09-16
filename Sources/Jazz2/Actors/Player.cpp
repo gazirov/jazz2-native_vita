@@ -1714,6 +1714,7 @@ namespace Jazz2::Actors
 		auto& light = lights.emplace_back();
 		light.Pos = _pos;
 		light.Intensity = 1.0f;
+		light.IsPlayerLight = true;
 		if (_sugarRushLeft > 0.0f) {
 			light.Brightness = 0.4f;
 			light.RadiusNear = 60.0f;

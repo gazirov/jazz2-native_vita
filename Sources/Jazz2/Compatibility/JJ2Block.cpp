@@ -11,18 +11,31 @@ using namespace Death::IO::Compression;
 namespace Jazz2::Compatibility
 {
 	JJ2Block::JJ2Block(std::unique_ptr<Stream>& s, std::int32_t length, std::int32_t uncompressedLength)
-		: _length(0), _offset(0)
+		: _length(0), _offset(0), _valid(false)
 	{
+		constexpr std::int32_t MaxBlockSize = 64 * 1024 * 1024;
+		if (s == nullptr || length < 0 || uncompressedLength < 0 || length > MaxBlockSize || uncompressedLength > MaxBlockSize ||
+			s->GetPosition() < 0 || s->GetPosition() > s->GetSize() || std::int64_t(length) > s->GetSize() - s->GetPosition()) {
+			return;
+		}
 		if (uncompressedLength > 0) {
+			if (length < 2) {
+				return;
+			}
 			s->Seek(2, SeekOrigin::Current);
 			_buffer = std::make_unique<uint8_t[]>(uncompressedLength);
 			DeflateStream uc(*s, length - 2);
-			uc.Read(_buffer.get(), uncompressedLength);		
-			_length = (uc.IsValid() ? uncompressedLength : 0);
+			const std::int64_t bytesRead = uc.Read(_buffer.get(), uncompressedLength);
+			if (uc.IsValid() && bytesRead == uncompressedLength) {
+				_length = uncompressedLength;
+				_valid = true;
+			}
 		} else {
 			_buffer = std::make_unique<uint8_t[]>(length);
-			s->Read(_buffer.get(), length);
-			_length = length;
+			if (s->Read(_buffer.get(), length) == length) {
+				_length = length;
+				_valid = true;
+			}
 		}
 	}
 

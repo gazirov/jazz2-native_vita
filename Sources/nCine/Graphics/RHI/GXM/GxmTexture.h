@@ -61,9 +61,7 @@ namespace nCine::RHI::GXM
 		/** @brief Returns the GPU-visible base address of the texels, allocating the copy if needed (used by @ref GxmRenderTarget) */
 		void* GetSurfaceData() const;
 		/** @brief Returns the byte distance between two rows of the GPU copy (its surface stride) */
-		inline std::uint32_t GetSurfaceStride() const {
-			return _gpuStride;
-		}
+		std::uint32_t GetSurfaceStride() const;
 		/** @brief Releases the GPU-visible copy (on re-allocation and destruction) */
 		void ReleaseGpu() const;
 
@@ -208,24 +206,31 @@ namespace nCine::RHI::GXM
 		SmallVector<std::uint8_t, 0> _pixels;
 		bool _isRenderTarget;
 
-		// GPU-visible copy, created lazily on the first bind (mutable so the const bind-time accessors can
-		// materialize it). `_contentsDirty` forces a refresh from the host store, `_samplerDirty` only a
-		// filter/wrap update of the control structure
-		mutable GxmMemory::Block _gpuBlock;
-		mutable SceGxmTexture _gpuTexture;
-		mutable std::uint32_t _gpuStride;
-		mutable bool _gpuStrided;			// the GPU copy uses SCE_GXM_TEXTURE_LINEAR_STRIDED
-		mutable bool _gpuValid;
+		// Normal sampled textures remain single-copy. Render targets use one tiled allocation and control
+		// structure for each frame slot, preventing a frame from sampling texels another one is overwriting.
+		static constexpr std::uint32_t FrameSlotCopyCount = 3;
+		struct GpuCopy
+		{
+			GxmMemory::Block Block;
+			SceGxmTexture Texture = {};
+			std::uint32_t Stride = 0;
+			bool Strided = false;
+			bool Valid = false;
+			bool SamplerApplied = false;
+		};
+		mutable GpuCopy _gpuCopies[FrameSlotCopyCount];
 		mutable bool _contentsDirty;
 		mutable bool _samplerDirty;
 
 		void Allocate(PixelFormat format, std::int32_t width, std::int32_t height);
 		/** @brief (Re)creates the GPU copy and its control structure when missing, then refreshes it if stale */
 		bool EnsureGpuTexture() const;
-		/** @brief Applies the tracked filter and wrap modes to the control structure */
-		void ApplySamplerState() const;
+		/** @brief Returns the active copy (slot zero for a sampled-only texture) */
+		GpuCopy& CurrentGpuCopy() const;
+		/** @brief Applies the tracked filter and wrap modes to one control structure */
+		void ApplySamplerState(GpuCopy& copy) const;
 		/** @brief Copies the host store into the GPU copy, baking the swizzle and the row padding in */
-		void UploadPixels() const;
+		void UploadPixels(GpuCopy& copy) const;
 		/** @brief Returns `true` if @ref _swizzle is the identity mapping (R,G,B,A) */
 		bool IsIdentitySwizzle() const;
 	};

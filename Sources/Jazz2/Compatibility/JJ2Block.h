@@ -57,6 +57,10 @@ namespace Jazz2::Compatibility
 		bool ReachedEndOfStream() {
 			return (_offset == INT32_MAX);
 		}
+		/** @brief Returns whether the complete packed block was read and, when applicable, decompressed */
+		bool IsValid() const {
+			return _valid;
+		}
 
 		/** @brief Returns the total length of the block in bytes */
 		std::int32_t GetLength() {
@@ -67,5 +71,6 @@ namespace Jazz2::Compatibility
 		std::unique_ptr<std::uint8_t[]> _buffer;
 		std::int32_t _length;
 		std::int32_t _offset;
+		bool _valid;
 	};
 }

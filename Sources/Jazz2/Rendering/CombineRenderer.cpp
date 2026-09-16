@@ -137,8 +137,10 @@ namespace Jazz2::Rendering
 				command.GetMaterial().SetTexture(3, *_owner->_blurPass4.GetTarget());
 #endif
 			} else {
-				command.GetMaterial().SetTexture(2, nullptr);
-				command.GetMaterial().SetTexture(3, nullptr);
+				// Combine always samples both bloom units. GXM has no safe equivalent of sampling an
+				// unbound texture, so use the scene as a harmless fallback while the blur passes are absent.
+				command.GetMaterial().SetTexture(2, *_owner->_viewTexture);
+				command.GetMaterial().SetTexture(3, *_owner->_viewTexture);
 			}
 			auto* instanceBlock = command.GetMaterial().UniformBlock(Material::InstanceBlockName);
 			instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(1.0f, 0.0f, 1.0f, 0.0f);

@@ -69,8 +69,10 @@ namespace Jazz2
 	// The lighting buffer is a full-resolution off-screen pass the composite samples per pixel, and halving
 	// it costs the SGX a quarter of that work for a difference the light falloff largely hides
 	std::uint8_t PreferencesCache::LightingResolutionPercent = 50;
+	std::uint8_t PreferencesCache::RenderingResolutionPercent = 100;
 #else
 	std::uint8_t PreferencesCache::LightingResolutionPercent = 100;
+	std::uint8_t PreferencesCache::RenderingResolutionPercent = 100;
 #endif
 	bool PreferencesCache::EnableReforgedGameplay = true;
 	bool PreferencesCache::EnableReforgedHUD = true;
@@ -1037,6 +1039,10 @@ namespace
 						LightingResolutionPercent = std::clamp(uc.ReadValue<std::uint8_t>(), std::uint8_t(10), std::uint8_t(100));
 					}
 
+					if (version >= 16) {
+						RenderingResolutionPercent = uc.ReadValue<std::uint8_t>();
+					}
+
 					// Touch button per-slot configuration (v14+)
 					EnableTouchJoystick = ((boolOptions & BoolOptions::EnableTouchJoystick) == BoolOptions::EnableTouchJoystick);
 					EnableTouchVibration = ((boolOptions & BoolOptions::EnableTouchVibration) == BoolOptions::EnableTouchVibration);
@@ -1197,12 +1203,16 @@ namespace
 		}
 
 #if defined(DEATH_TARGET_VITA)
-		// Jazz2.config is shared with older VitaGL builds and can restore a renderer-specific post-process
-		// path. Keep the proven Phase 0 GXM configuration without resetting controls or episode progress.
+		// Jazz2.config is shared with older VitaGL builds and can restore renderer-specific values. Keep the
+		// proven GXM defaults without resetting user-selected quality options, controls, or episode progress.
 		ActiveRescaleMode = RescaleMode::None;
-		BlurEffects = true;
 		LowWaterQuality = false;
-		LightingResolutionPercent = 50;
+		if (LightingResolutionPercent != 12 && LightingResolutionPercent != 25 && LightingResolutionPercent != 50) {
+			LightingResolutionPercent = 50;
+		}
+		if (RenderingResolutionPercent != 50 && RenderingResolutionPercent != 75 && RenderingResolutionPercent != 100) {
+			RenderingResolutionPercent = 50;
+		}
 		UnalignedViewport = false;
 
 		// This log records the effective values after Jazz2.config and the Vita profile are both applied.
@@ -1214,8 +1224,8 @@ namespace
 			configLog.Write("\n", 1);
 			char entry[256];
 			std::size_t length = formatInto(entry,
-				"Vita GXM effective graphics config\nrescale={} blur={} low-water={} lighting={} unaligned-viewport={} background-dithering={} zoom-out={} metrics={} max-fps={}\n",
-				std::int32_t(ActiveRescaleMode), BlurEffects, LowWaterQuality, LightingResolutionPercent,
+				"Vita GXM effective graphics config\nrescale={} blur={} low-water={} rendering={} lighting={} unaligned-viewport={} background-dithering={} zoom-out={} metrics={} max-fps={}\n",
+				std::int32_t(ActiveRescaleMode), BlurEffects, LowWaterQuality, RenderingResolutionPercent, LightingResolutionPercent,
 				UnalignedViewport, BackgroundDithering, PreferZoomOut, ShowPerformanceMetrics, MaxFps);
 			configLog.Write(entry, length);
 			configLog.Flush();
@@ -1360,6 +1370,7 @@ namespace
 		co.Write(UniqueServerID, sizeof(UniqueServerID));
 
 		co.WriteValue<std::uint8_t>(LightingResolutionPercent);
+		co.WriteValue<std::uint8_t>(RenderingResolutionPercent);
 
 		// Per-button touch layout (v14+)
 		for (std::size_t i = 0; i < (std::size_t)TouchButtonSlot::Count; i++) {
@@ -1416,6 +1427,14 @@ namespace
 
 #if defined(DEATH_TARGET_EMSCRIPTEN)
 		fs::SyncToPersistent();
+#endif
+	}
+
+	void PreferencesCache::ApplyRenderingResolution()
+	{
+#if defined(WITH_RHI_GXM)
+		auto& gfxDevice = theApplication().GetGfxDevice();
+		gfxDevice.setDrawableSize(960 * RenderingResolutionPercent / 100, 544 * RenderingResolutionPercent / 100);
 #endif
 	}
 

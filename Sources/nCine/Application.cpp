@@ -68,6 +68,9 @@ extern "C"
 #include <Containers/StringConcatenable.h>
 #include <Containers/StringView.h>
 #include <IO/FileSystem.h>
+
+#include <cstring>
+
 #if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
 #	include <IO/FileStream.h>
 #	include "Graphics/RHI/GXM/GxmDevice.h"
@@ -935,49 +938,74 @@ namespace nCine
 		// Log only sustained slowdowns to avoid loading and shader compilation hitches.
 		static float slowFrameDuration = 0.0f;
 		static float logCooldown = 0.0f;
-		static std::unique_ptr<FileStream> performanceLog = []() {
-				auto file = std::make_unique<FileStream>("ux0:/data/Jazz2/VitaGxmPerformance.log"_s,
-					FileSystem::FileExists("ux0:/data/Jazz2/VitaGxmPerformance.log"_s) ? FileAccess::ReadWrite : FileAccess::Write);
-				if (file->IsValid()) {
-					file->Seek(0, SeekOrigin::End);
-					file->Write("\n", 1);
-					constexpr char Header[] = "Vita GXM safe telemetry: entries follow 0.5 seconds below 55 FPS\n";
-				file->Write(Header, sizeof(Header) - 1);
-				file->Flush();
-			}
-			return file;
-		}();
+		static constexpr std::uint32_t FrameTimeSampleCount = 120;
+		static float frameTimeSamples[FrameTimeSampleCount];
+		static std::uint32_t frameTimeSampleWriteIndex = 0;
+		static std::uint32_t frameTimeSampleCount = 0;
 		const float frameDuration = _frameTimer->GetLastFrameDuration();
 		if (frameDuration > (1.0f / 55.0f)) {
+			if (slowFrameDuration == 0.0f) {
+				// Discard normal-frame activity so the first slow report covers only this slowdown.
+				RHI::GXM::GxmDevice::GetAndResetTelemetry();
+				frameTimeSampleWriteIndex = 0;
+				frameTimeSampleCount = 0;
+			}
+			frameTimeSamples[frameTimeSampleWriteIndex] = frameDuration;
+			frameTimeSampleWriteIndex = (frameTimeSampleWriteIndex + 1) % FrameTimeSampleCount;
+			frameTimeSampleCount = std::min(frameTimeSampleCount + 1, FrameTimeSampleCount);
 			slowFrameDuration += std::min(frameDuration, 0.1f);
 		} else {
 			slowFrameDuration = 0.0f;
+			frameTimeSampleCount = 0;
 		}
 		logCooldown -= frameDuration;
-		if (slowFrameDuration >= 0.5f && logCooldown <= 0.0f && performanceLog->IsValid()) {
-			const auto deviceTelemetry = RHI::GXM::GxmDevice::GetAndResetTelemetry();
-			const auto surfaceTelemetry = RHI::GXM::GxmMemory::GetAndResetSurfaceTelemetry();
-			char entry[352];
-			std::size_t length = formatInto(entry,
-				"GxmPerf: {:.1f} ms, {:.1f} FPS; gpu {} KB; scenes {}/{}/{} present {}; wait {:.1f} ms finish {:.1f} ms; surfaces {}/{} new {} reuse {}\n",
-				frameDuration * 1000.0f, _frameTimer->GetAverageFps(), RHI::GXM::GxmMemory::GetAllocatedBytes() / 1024,
-				deviceTelemetry.SceneBegins, deviceTelemetry.SceneFinishes, deviceTelemetry.NotificationWaits,
-				deviceTelemetry.Presents, deviceTelemetry.NotificationWaitMicroseconds / 1000.0f,
-				deviceTelemetry.FinishMicroseconds / 1000.0f, surfaceTelemetry.InUseSurfaces, surfaceTelemetry.RetainedSurfaces,
-				surfaceTelemetry.NewAcquisitions, surfaceTelemetry.ReusedAcquisitions);
-			performanceLog->Write(entry, length);
-			for (const auto& draw : deviceTelemetry.ShaderDraws) {
-				if (draw.ProgramName == nullptr) {
-					break;
+		if (slowFrameDuration >= 0.5f && logCooldown <= 0.0f) {
+			FileStream performanceLog("ux0:/data/Jazz2/VitaGxmPerformance.log"_s,
+				FileSystem::FileExists("ux0:/data/Jazz2/VitaGxmPerformance.log"_s) ? FileAccess::ReadWrite : FileAccess::Write);
+			if (performanceLog.IsValid()) {
+				performanceLog.Seek(0, SeekOrigin::End);
+				performanceLog.Write("\n", 1);
+				constexpr char Header[] = "Vita Composite telemetry: entries follow 0.5 seconds below 55 FPS\n";
+				performanceLog.Write(Header, sizeof(Header) - 1);
+				const auto deviceTelemetry = RHI::GXM::GxmDevice::GetAndResetTelemetry();
+				float sortedFrameTimes[FrameTimeSampleCount];
+				for (std::uint32_t i = 0; i < frameTimeSampleCount; i++) {
+					sortedFrameTimes[i] = frameTimeSamples[i];
 				}
-				char drawEntry[128];
-				length = formatInto(drawEntry, "GxmDraw: {} calls {} indices {}; scene ends {} wait {:.1f} ms present {:.1f} ms\n",
-					draw.ProgramName, draw.Calls, draw.Indices, draw.SceneEnds, draw.WaitMicroseconds / 1000.0f,
-					draw.PresentFinishMicroseconds / 1000.0f);
-				performanceLog->Write(drawEntry, length);
+				sort(sortedFrameTimes, sortedFrameTimes + frameTimeSampleCount);
+				const std::uint32_t p50Index = frameTimeSampleCount / 2;
+				const std::uint32_t p95Index = (frameTimeSampleCount * 95 + 99) / 100 - 1;
+				char entry[256];
+				std::size_t length = formatInto(entry,
+					"GxmCompositePerf: {:.1f} ms, {:.1f} FPS; frame samples {} p50 {:.1f} ms p95 {:.1f} ms\n",
+					frameDuration * 1000.0f, _frameTimer->GetAverageFps(), frameTimeSampleCount,
+					sortedFrameTimes[p50Index] * 1000.0f, sortedFrameTimes[p95Index] * 1000.0f);
+				length = std::min(length, sizeof(entry) - 1);
+				performanceLog.Write(entry, length);
+				for (const auto& draw : deviceTelemetry.TargetShaderDraws) {
+					if (draw.ProgramName == nullptr) {
+						break;
+					}
+					char drawEntry[160];
+					length = formatInto(drawEntry, "GxmCompositeTargetDraw: {} rt#{} {} calls {} indices {}\n",
+						draw.TargetLabel, draw.TargetId, draw.ProgramName, draw.Calls, draw.Indices);
+					performanceLog.Write(drawEntry, length);
+				}
+				for (const auto& dependency : deviceTelemetry.DependencyWaitsByPass) {
+					if (dependency.ProducerProgram == nullptr) {
+						break;
+					}
+					char dependencyEntry[256];
+					length = formatInto(dependencyEntry, "GxmCompositeDependency: {} rt#{} {}x{} {} -> {}/{} waits {} {:.1f} ms\n",
+						dependency.ProducerTargetLabel, dependency.ProducerTargetId, dependency.ProducerWidth, dependency.ProducerHeight, dependency.ProducerProgram,
+						dependency.ConsumerLabel, dependency.ConsumerProgram, dependency.Count, dependency.WaitMicroseconds / 1000.0f);
+					performanceLog.Write(dependencyEntry, length);
+				}
+				performanceLog.Flush();
+				logCooldown = 2.0f;
+			} else {
+				logCooldown = 2.0f;
 			}
-			performanceLog->Flush();
-			logCooldown = 2.0f;
 		}
 #endif
 

@@ -7,6 +7,7 @@
 #include "../../../../Shaders/Generated/ShaderCompilerTypes.h"
 #include "../../../../Shaders/Generated/CgGeneratedShaders.h"
 #include "../../Material.h"
+#include "../../RenderResources.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +25,7 @@ namespace nCine::RHI::GXM
 {
 	namespace
 	{
+		constexpr char GxpCacheRootDirectory[] = "ux0:/data/Jazz2/GxpCache";
 		constexpr char GxpCacheDirectory[] = "ux0:/data/Jazz2/GxpCache/v1";
 		constexpr char PackagedGxpCacheDirectory[] = "app0:/GxpCache/v1";
 		constexpr std::uint32_t GxpCacheMagic = 0x47585043; // "GXPC"
@@ -44,6 +46,42 @@ namespace nCine::RHI::GXM
 			sourceHash = Death::Cryptography::xxHash3(source, std::strlen(source));
 			return std::snprintf(path, sizeof(path), "%s/%016llx.%s.gxp", directory,
 				static_cast<unsigned long long>(sourceHash), vertexStage ? "vs" : "fs") > 0;
+		}
+
+		bool MigrateGxpCacheFile(Death::Containers::StringView path)
+		{
+			if (!Death::IO::FileSystem::FileExists(path)) {
+				return true;
+			}
+
+			const Death::Containers::String legacyPath = path + ".legacy";
+			if (Death::IO::FileSystem::Exists(legacyPath)) {
+				return Death::IO::FileSystem::RemoveFile(path);
+			}
+			return Death::IO::FileSystem::Move(path, legacyPath);
+		}
+
+		bool EnsureGxpCacheDirectory()
+		{
+			static bool checked = false;
+			static bool available = false;
+			if (checked) {
+				return available;
+			}
+			checked = true;
+
+			// Early GXM builds used one of these paths as a file. A file at either level prevents every
+			// later shader cache write, forcing expensive on-device Cg compilation on each launch. Preserve
+			// it for diagnosis and recreate the intended versioned directory.
+			const Death::Containers::StringView cacheRootDirectory{GxpCacheRootDirectory};
+			const Death::Containers::StringView cacheDirectory{GxpCacheDirectory};
+			if (!MigrateGxpCacheFile(cacheRootDirectory) || !MigrateGxpCacheFile(cacheDirectory)) {
+				LOGW("Cannot migrate GXP cache path \"{}\"", GxpCacheRootDirectory);
+				return false;
+			}
+
+			available = Death::IO::FileSystem::CreateDirectories(cacheDirectory);
+			return available;
 		}
 
 		SceGxmProgram* LoadCachedGxp(const char* source, bool vertexStage, std::uint32_t& sizeInBytes)
@@ -92,7 +130,7 @@ namespace nCine::RHI::GXM
 			char path[128];
 			std::uint64_t sourceHash;
 			if (program == nullptr || sizeInBytes == 0 || sizeInBytes > MaxCachedGxpSize || !MakeGxpCachePath(GxpCacheDirectory, source, vertexStage, path, sourceHash) ||
-				!Death::IO::FileSystem::CreateDirectories(Death::Containers::StringView{GxpCacheDirectory})) {
+				!EnsureGxpCacheDirectory()) {
 				return;
 			}
 
@@ -210,6 +248,7 @@ namespace nCine::RHI::GXM
 	{
 		GxmDevice::OnProgramDestroyed(this);
 		ReleaseGpu();
+		RenderResources::RemoveCameraUniformData(this);
 	}
 
 	void GxmShaderProgram::ReleaseGpu()
@@ -336,16 +375,12 @@ namespace nCine::RHI::GXM
 
 		// Application::Step() telemetry starts after the startup shader set is linked. Keep this flushed record
 		// separate so offline-GXP work can be justified by real console compile time.
-		static Death::IO::FileStream compileLog(Death::Containers::StringView{"ux0:/data/Jazz2/VitaGxmShaderCompile.log"},
+		// Keep no telemetry file descriptor alive while the game runs: Vita has a small process-wide file-object
+		// budget, and retained resource streams need the remaining slots during level and menu transitions.
+		Death::IO::FileStream compileLog(Death::Containers::StringView{"ux0:/data/Jazz2/VitaGxmShaderCompile.log"},
 			Death::IO::FileSystem::FileExists(Death::Containers::StringView{"ux0:/data/Jazz2/VitaGxmShaderCompile.log"}) ? Death::IO::FileAccess::ReadWrite : Death::IO::FileAccess::Write);
-		static const bool compileLogAtEnd = []() {
-			if (compileLog.IsValid()) {
-				compileLog.Seek(0, Death::IO::SeekOrigin::End);
-			}
-			return true;
-		}();
-		static_cast<void>(compileLogAtEnd);
 		if (compileLog.IsValid()) {
+			compileLog.Seek(0, Death::IO::SeekOrigin::End);
 			char entry[256];
 			const std::size_t length = Death::formatInto(entry, "GxmShaderCompile: {}/{} vs {} {:.3f} ms ({} B) fs {} {:.3f} ms ({} B) total {:.3f} ms\n",
 				_programName != nullptr ? _programName : "<unnamed>", _variantName != nullptr ? _variantName : "default",

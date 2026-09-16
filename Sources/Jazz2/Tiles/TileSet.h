@@ -6,7 +6,9 @@
 #include "../../nCine/Graphics/Texture.h"
 
 #include <memory>
+#include <array>
 
+#include <Containers/Array.h>
 #include <Containers/ArrayView.h>
 #include <Containers/SmallVector.h>
 #include <Containers/String.h>
@@ -44,7 +46,13 @@ namespace Jazz2::Tiles
 		 * @param captionTile        Pixels of the caption tile
 		 * @param tileDiffuseOpaque  Optional table marking fully opaque tiles
 		 */
-		TileSet(StringView path, std::uint16_t tileCount, SmallVector<std::unique_ptr<Texture>, 1>&& textureDiffuse, std::unique_ptr<std::uint8_t[]> mask, std::uint32_t maskSize, std::unique_ptr<Color[]> captionTile, const std::uint8_t* tileDiffuseOpaque = nullptr);
+		TileSet(StringView path, std::uint16_t tileCount, SmallVector<std::unique_ptr<Texture>, 1>&& textureDiffuse,
+			std::unique_ptr<std::uint8_t[]> mask, std::uint32_t maskSize, std::unique_ptr<Color[]> captionTile,
+			const std::uint8_t* tileDiffuseOpaque = nullptr
+#if defined(DEATH_TARGET_VITA)
+			, SmallVector<Array<std::uint8_t>, 1>&& indexedDiffuseTexels = {}
+#endif
+		);
 
 		/** @brief Relative path to source file */
 		String FilePath;
@@ -93,6 +101,20 @@ namespace Jazz2::Tiles
 		{
 			return std::int32_t(TextureDiffuse.size());
 		}
+
+#if defined(DEATH_TARGET_VITA)
+		enum class BakedDiffuseFailure : std::uint8_t {
+			None,
+			InvalidSource,
+			MissingIndexedTexels,
+			TextureUpload
+		};
+
+		/// Returns a cached RGBA expansion of an indexed atlas chunk for the requested palette row.
+		/// `nullptr` keeps callers on the indexed shader path when baking is unavailable.
+		Texture* GetBakedDiffuse(std::int32_t chunk, std::uint16_t paletteOffset, ArrayView<const std::uint32_t> palettes,
+			BakedDiffuseFailure* failure = nullptr);
+#endif
 
 		/** @brief Returns the packed mask (@ref MaskBytesPerTile bytes, 1 bit per pixel) for the specified tile */
 		const std::uint8_t* GetTileMask(std::int32_t tileId) const
@@ -192,5 +214,16 @@ namespace Jazz2::Tiles
 		BitArray _isMaskFilled;
 		BitArray _isTileFilled;
 		BitArray _isColumnContiguous;
+#if defined(DEATH_TARGET_VITA)
+		struct BakedDiffuse
+		{
+			std::uint16_t PaletteOffset;
+			std::array<std::uint32_t, 256> Palette;
+			SmallVector<std::unique_ptr<Texture>, 1> Textures;
+		};
+
+		SmallVector<Array<std::uint8_t>, 1> _indexedDiffuseTexels;
+		SmallVector<BakedDiffuse, 1> _bakedDiffuse;
+#endif
 	};
 }

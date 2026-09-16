@@ -24,5 +24,7 @@ namespace Jazz2
 		float RadiusNear;
 		/** @brief Light far radius */
 		float RadiusFar;
+		/** @brief Keeps the player's local light when the Vita light budget is full */
+		bool IsPlayerLight = false;
 	};
 }

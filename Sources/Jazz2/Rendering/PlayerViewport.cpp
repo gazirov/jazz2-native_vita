@@ -47,7 +47,7 @@ namespace Jazz2::Rendering
 			_view->SetClearMode(Viewport::ClearMode::Never);
 #else
 			_viewTexture = std::make_unique<Texture>(nullptr, Texture::ColorTargetFormat, w, h);
-			_view = std::make_unique<Viewport>(_viewTexture.get(), Viewport::DepthStencilFormat::None);
+			_view = std::make_unique<Viewport>("Scene", _viewTexture.get(), Viewport::DepthStencilFormat::None);
 #endif
 
 			_camera = std::make_unique<Camera>();
@@ -85,7 +85,7 @@ namespace Jazz2::Rendering
 			_lightingRenderer = std::make_unique<LightingRenderer>(this);
 			_lightingBuffer = std::make_unique<Texture>(nullptr, LightingBufferFormat,
 				w * PreferencesCache::LightingResolutionPercent / 100, h * PreferencesCache::LightingResolutionPercent / 100);
-			_lightingView = std::make_unique<Viewport>(_lightingBuffer.get(), Viewport::DepthStencilFormat::None);
+			_lightingView = std::make_unique<Viewport>("Lighting", _lightingBuffer.get(), Viewport::DepthStencilFormat::None);
 			_lightingView->SetRootNode(_lightingRenderer.get());
 			_lightingView->SetCamera(_camera.get());
 		} else {
@@ -102,8 +102,15 @@ namespace Jazz2::Rendering
 			// The blur targets are sized to the displayed (logical) viewport size rather than the (possibly
 			// supersampled) texture size, so the blur strength - and the in-game bloom - stay consistent in splitscreen
 			// zoom-out. Otherwise the larger per-player texture makes the blur cover a smaller fraction of the view
+			// On Vita the first blur pass samples the full scene directly while writing its half-resolution target.
+			// This folds the downsample target into hardware minification and removes one producer/consumer scene.
+#if defined(DEATH_TARGET_VITA)
+			_downsamplePass.Dispose();
+			_blurPass1.Initialize(_viewTexture.get(), bounds.W / 2, bounds.H / 2, Vector2f(1.0f, 0.0f));
+#else
 			_downsamplePass.Initialize(_viewTexture.get(), w / 2, h / 2, Vector2f(0.0f, 0.0f));
 			_blurPass1.Initialize(_downsamplePass.GetTarget(), bounds.W / 2, bounds.H / 2, Vector2f(1.0f, 0.0f));
+#endif
 			_blurPass2.Initialize(_blurPass1.GetTarget(), bounds.W / 2, bounds.H / 2, Vector2f(0.0f, 1.0f));
 #if defined(DEATH_TARGET_VITA)
 			// The Vita keeps the half-resolution blur for bloom but reuses it for the quarter sample in Combine.
@@ -145,7 +152,10 @@ namespace Jazz2::Rendering
 #endif
 			_blurPass2.Register();
 			_blurPass1.Register();
+			// Vita folds downsampling into the first half-resolution blur pass.
+#if !defined(DEATH_TARGET_VITA)
 			_downsamplePass.Register();
+#endif
 		}
 #endif
 

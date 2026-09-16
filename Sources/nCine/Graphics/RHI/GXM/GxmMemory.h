@@ -54,6 +54,8 @@ namespace nCine::RHI::GXM
 			std::uint32_t Size = 0;
 			/** @brief USSE offset of the block, for the two USSE allocators (0 otherwise) */
 			std::uint32_t UsseOffset = 0;
+			/** @brief Changes whenever a retained render-target surface is handed to a new texture */
+			std::uint32_t SurfaceGeneration = 0;
 
 			inline bool IsValid() const {
 				return (Base != nullptr);
@@ -114,10 +116,20 @@ namespace nCine::RHI::GXM
 		{
 			std::uint32_t RetainedSurfaces = 0;
 			std::uint32_t InUseSurfaces = 0;
+			std::uint32_t RetainedBytes = 0;
+			std::uint32_t InUseBytes = 0;
 			std::uint32_t NewAcquisitions = 0;
 			std::uint32_t ReusedAcquisitions = 0;
 		};
 		/** @brief Returns current render-target pool state and clears interval acquisition counters */
 		SurfaceTelemetry GetAndResetSurfaceTelemetry();
+
+		struct FreeMemory
+		{
+			std::uint32_t UserBytes = 0;
+			std::uint32_t CdramBytes = 0;
+		};
+		/** @brief Returns the kernel's currently available USER and CDRAM memory, or zeroes when unavailable */
+		FreeMemory GetFreeMemory();
 	}
 }

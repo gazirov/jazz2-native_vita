@@ -160,6 +160,11 @@ namespace nCine
 		 * @note If the application is in full screen this method will have no effect.
 		 */
 		virtual void setWindowSize(int width, int height) = 0;
+		/** @brief Sets the pixel size the frame is rendered at without changing the window */
+		inline virtual void setDrawableSize(int width, int height) {
+			static_cast<void>(width);
+			static_cast<void>(height);
+		}
 
 		/** @brief Returns the window position as a `Vector2i` object */
 		inline virtual const Vector2i windowPosition() const { return Vector2i(0, 0); }

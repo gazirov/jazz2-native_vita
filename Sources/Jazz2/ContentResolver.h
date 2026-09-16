@@ -373,7 +373,11 @@ namespace Jazz2
 		SmallVector<std::unique_ptr<Texture>, 1> BuildTilesetDiffuse(std::unique_ptr<Stream>& s, const char* name, std::uint8_t channelCount,
 			std::uint32_t width, std::uint32_t height, std::uint16_t tileCount, const std::uint8_t* is32bitTile,
 			const std::uint8_t* paletteRemapping, std::uint16_t captionTileId, bool& indexTiles,
-			std::unique_ptr<std::uint8_t[]>& tileDiffuseOpaque, std::unique_ptr<Color[]>& captionTile);
+			std::unique_ptr<std::uint8_t[]>& tileDiffuseOpaque, std::unique_ptr<Color[]>& captionTile
+#if defined(DEATH_TARGET_VITA)
+			, SmallVector<Array<std::uint8_t>, 1>& indexedDiffuseTexels
+#endif
+		);
 		// Packs an indexed sprite/tile (palette index in the red/first channel) into the smallest texture format: R8
 		// when alpha is on/off only (4x less VRAM than RGBA8), or RG8 keeping the per-pixel alpha in green (sampled
 		// into .a via swizzle) when alpha is partial. `srcChannels` is the bytes-per-pixel of `pixels`: 1 (index

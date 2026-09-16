@@ -120,7 +120,7 @@ namespace Jazz2::Rendering
 			_node->setVisitOrderState(SceneNode::VisitOrderState::Disabled);
 
 			_target = std::make_unique<Texture>(nullptr, targetFormat, textureWidth, textureHeight);
-			_view = std::make_unique<Viewport>(_target.get(), Viewport::DepthStencilFormat::None);
+			_view = std::make_unique<Viewport>(overlay ? "UI" : "Composite", _target.get(), Viewport::DepthStencilFormat::None);
 			_view->SetRootNode(_node.get());
 			_view->SetCamera(&_camera);
 			_view->SetClearMode(Viewport::ClearMode::Never);

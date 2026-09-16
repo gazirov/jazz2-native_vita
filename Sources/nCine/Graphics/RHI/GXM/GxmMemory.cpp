@@ -26,6 +26,7 @@ namespace nCine::RHI::GXM
 			std::uint32_t Stride = 0;
 			std::uint32_t Height = 0;
 			GxmMemory::Block Memory;
+			std::uint32_t Generation = 0;
 			bool InUse = false;
 		};
 
@@ -104,6 +105,11 @@ namespace nCine::RHI::GXM
 		for (RetainedSurface& surface : _retainedSurfaces) {
 			if (!surface.InUse && surface.Stride == stride && surface.Height == height) {
 				surface.InUse = true;
+				surface.Generation++;
+				if (surface.Generation == 0) {
+					surface.Generation = 1;
+				}
+				surface.Memory.SurfaceGeneration = surface.Generation;
 				_surfaceReusedAcquisitions++;
 				return surface.Memory;
 			}
@@ -116,8 +122,11 @@ namespace nCine::RHI::GXM
 				surface.Stride = stride;
 				surface.Height = height;
 				surface.Memory = block;
+				surface.Generation = 1;
+				surface.Memory.SurfaceGeneration = surface.Generation;
 				surface.InUse = true;
 				_surfaceNewAcquisitions++;
+				block = surface.Memory;
 			} else {
 				// Out of slots to keep addresses stable in, so this one goes back to the allocator when it is
 				// released - it may then be handed to a target of another size, with the consequences above
@@ -136,6 +145,12 @@ namespace nCine::RHI::GXM
 
 		for (RetainedSurface& surface : _retainedSurfaces) {
 			if (surface.Memory.Uid == block.Uid) {
+				if (!surface.InUse || block.SurfaceGeneration != surface.Generation) {
+					// A stale texture must not retire a block that has already been reused by a new render target.
+					LOGW("Ignoring stale release of retained render-target surface uid {} generation {}", block.Uid, block.SurfaceGeneration);
+					block = Block();
+					return;
+				}
 				// Kept mapped and kept out of the allocator, so the next target of this geometry lands on the
 				// very same address; the caller's handle goes away either way
 				surface.InUse = false;
@@ -248,6 +263,7 @@ namespace nCine::RHI::GXM
 		block.Base = nullptr;
 		block.Size = 0;
 		block.UsseOffset = 0;
+		block.SurfaceGeneration = 0;
 		block.MappedAs = Kind::Mapped;
 	}
 
@@ -261,8 +277,10 @@ namespace nCine::RHI::GXM
 		SurfaceTelemetry telemetry;
 		telemetry.RetainedSurfaces = _retainedSurfaceCount;
 		for (const RetainedSurface& surface : _retainedSurfaces) {
+			telemetry.RetainedBytes += surface.Memory.Size;
 			if (surface.InUse) {
 				telemetry.InUseSurfaces++;
+				telemetry.InUseBytes += surface.Memory.Size;
 			}
 		}
 		telemetry.NewAcquisitions = _surfaceNewAcquisitions;
@@ -270,5 +288,15 @@ namespace nCine::RHI::GXM
 		_surfaceNewAcquisitions = 0;
 		_surfaceReusedAcquisitions = 0;
 		return telemetry;
+	}
+
+	GxmMemory::FreeMemory GxmMemory::GetFreeMemory()
+	{
+		SceKernelFreeMemorySizeInfo info = {};
+		info.size = sizeof(info);
+		if (sceKernelGetFreeMemorySize(&info) < 0) {
+			return {};
+		}
+		return { std::uint32_t(info.size_user > 0 ? info.size_user : 0), std::uint32_t(info.size_cdram > 0 ? info.size_cdram : 0) };
 	}
 }

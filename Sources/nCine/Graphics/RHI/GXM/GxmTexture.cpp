@@ -57,13 +57,12 @@ namespace nCine::RHI::GXM
 		: _handle(_nextHandle++), _target(target), _format(PixelFormat::Unknown), _uploadFormat(PixelFormat::Unknown),
 			_width(0), _height(0), _strideBytes(0),
 			_minFilter(nCine::SamplerFilter::Nearest), _magFilter(nCine::SamplerFilter::Nearest), _wrap(SamplerWrapping::ClampToEdge),
-			_textureUnit(0), _isRenderTarget(false), _gpuStride(0), _gpuStrided(false), _gpuValid(false), _contentsDirty(false), _samplerDirty(true)
+		_textureUnit(0), _isRenderTarget(false), _contentsDirty(false), _samplerDirty(true)
 	{
 		_swizzle[0] = SwizzleChannel::Red;
 		_swizzle[1] = SwizzleChannel::Green;
 		_swizzle[2] = SwizzleChannel::Blue;
 		_swizzle[3] = SwizzleChannel::Alpha;
-		std::memset(&_gpuTexture, 0, sizeof(_gpuTexture));
 	}
 
 	GxmTexture::~GxmTexture()
@@ -76,18 +75,22 @@ namespace nCine::RHI::GXM
 
 	void GxmTexture::ReleaseGpu() const
 	{
-		if (_gpuBlock.IsValid()) {
+		bool hasGpuCopy = false;
+		for (const GpuCopy& copy : _gpuCopies) {
+			hasGpuCopy |= copy.Block.IsValid();
+		}
+		if (hasGpuCopy) {
 			// The GPU may still be reading these texels from a scene that has been submitted but not yet
 			// consumed, and the memory is about to be unmapped
-			GxmDevice::FinishScene();
+			GxmDevice::WaitForGpuIdle();
 			// Whether this block is a render target's - which is retired for reuse at the same address instead
 			// of released - is decided by who owns it rather than by _isRenderTarget, which a detach has already
 			// flipped by the time this runs
-			GxmMemory::ReleaseSurface(_gpuBlock);
+			for (GpuCopy& copy : _gpuCopies) {
+				GxmMemory::ReleaseSurface(copy.Block);
+				copy = {};
+			}
 		}
-		_gpuValid = false;
-		_gpuStride = 0;
-		_gpuStrided = false;
 	}
 
 	std::int32_t GxmTexture::BytesPerPixel(PixelFormat format)
@@ -149,7 +152,8 @@ namespace nCine::RHI::GXM
 			return false;
 		}
 
-		if (!_gpuBlock.IsValid()) {
+		GpuCopy& copy = CurrentGpuCopy();
+		if (!copy.Block.IsValid()) {
 			// A colour attachment gets the **tiled** layout, not a linear one. A linear texture cannot address
 			// outside [0, 1] at all - the addressing mode is accepted and then simply does not happen - and every
 			// render target here is sampled by a later pass that needs exactly that: the scrolling background
@@ -164,74 +168,83 @@ namespace nCine::RHI::GXM
 				? ((std::uint32_t(_width) + 31u) & ~31u) : std::uint32_t(_width));
 			const std::uint32_t alignedHeight = (tiled
 				? ((std::uint32_t(_height) + 31u) & ~31u) : std::uint32_t(_height));
-			_gpuStride = alignedWidth * 4u;
-			_gpuStrided = (!tiled && (_width % 8) != 0);
-			const std::uint32_t size = _gpuStride * alignedHeight;
+			copy.Stride = alignedWidth * 4u;
+			copy.Strided = (!tiled && (_width % 8) != 0);
+			const std::uint32_t size = copy.Stride * alignedHeight;
 			// A colour attachment is rendered into every frame, so it belongs in the memory the GPU writes
 			// fastest; sampled-only texels are uploaded once and stay in main memory, of which there is far more.
 			// A colour attachment additionally wants the address it had last time the pipeline built this target
 			// (see GxmMemory::AcquireSurface()), which is why it does not go through the plain allocator
-			_gpuBlock = (_isRenderTarget
-				? GxmMemory::AcquireSurface("Jazz2:RenderTarget", _gpuStride, alignedHeight)
+			copy.Block = (_isRenderTarget
+				? GxmMemory::AcquireSurface("Jazz2:RenderTarget", copy.Stride, alignedHeight)
 				: GxmMemory::Alloc("Jazz2:Texture", size, SCE_GXM_MEMORY_ATTRIB_READ));
-			if (!_gpuBlock.IsValid()) {
+			if (!copy.Block.IsValid()) {
 				LOGE("Failed to allocate {}x{} texture ({} bytes) in GPU-visible memory", _width, _height, size);
 				return false;
 			}
 
 			std::int32_t result;
 			if (tiled) {
-				result = sceGxmTextureInitTiled(&_gpuTexture, _gpuBlock.Base,
+				result = sceGxmTextureInitTiled(&copy.Texture, copy.Block.Base,
 					SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, std::uint32_t(_width), std::uint32_t(_height), 0);
-			} else if (_gpuStrided) {
-				result = sceGxmTextureInitLinearStrided(&_gpuTexture, _gpuBlock.Base,
-					SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, std::uint32_t(_width), std::uint32_t(_height), _gpuStride);
+			} else if (copy.Strided) {
+				result = sceGxmTextureInitLinearStrided(&copy.Texture, copy.Block.Base,
+					SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, std::uint32_t(_width), std::uint32_t(_height), copy.Stride);
 			} else {
-				result = sceGxmTextureInitLinear(&_gpuTexture, _gpuBlock.Base,
+				result = sceGxmTextureInitLinear(&copy.Texture, copy.Block.Base,
 					SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, std::uint32_t(_width), std::uint32_t(_height), 0);
 			}
 			if (result < 0) {
 				LOGE("sceGxmTextureInit{}({}x{}) failed with 0x{:.8x}",
-					tiled ? "Tiled" : (_gpuStrided ? "LinearStrided" : "Linear"),
+					tiled ? "Tiled" : (copy.Strided ? "LinearStrided" : "Linear"),
 					_width, _height, std::uint32_t(result));
-				GxmMemory::ReleaseSurface(_gpuBlock);
+				GxmMemory::ReleaseSurface(copy.Block);
 				return false;
 			}
 
-			_gpuValid = true;
-			_samplerDirty = true;
+			copy.Valid = true;
+			copy.SamplerApplied = false;
 			// A render target's texels are produced by the GPU, so there is nothing to upload into it - and
 			// uploading the (empty) host store would wipe a target that has already been rendered into
 			_contentsDirty = !_isRenderTarget;
 		}
 
-		if (_samplerDirty) {
-			ApplySamplerState();
-			_samplerDirty = false;
+		if (_samplerDirty || !copy.SamplerApplied) {
+			ApplySamplerState(copy);
+			copy.SamplerApplied = true;
 		}
+		_samplerDirty = false;
 		if (_contentsDirty) {
-			UploadPixels();
+			UploadPixels(copy);
 			_contentsDirty = false;
 		}
-		return _gpuValid;
+		return copy.Valid;
 	}
 
-	void GxmTexture::ApplySamplerState() const
+	GxmTexture::GpuCopy& GxmTexture::CurrentGpuCopy() const
+	{
+		// Off-screen textures stay on slot zero until persistent targets have a proven population path.
+		// Context, screen and depth resources are still frame-owned; this only avoids sampling an unfilled
+		// viewport copy for one-shot menu and level backgrounds.
+		return _gpuCopies[0];
+	}
+
+	void GxmTexture::ApplySamplerState(GpuCopy& copy) const
 	{
 		// A strided texture has one filter field for both directions and no mip filter at all; programming
 		// either of the two rejects the call with SCE_GXM_ERROR_UNSUPPORTED, so only the shared one is set
-		sceGxmTextureSetMagFilter(&_gpuTexture, TranslateFilter(_magFilter));
-		if (!_gpuStrided) {
-			sceGxmTextureSetMinFilter(&_gpuTexture, TranslateFilter(_minFilter));
-			sceGxmTextureSetMipFilter(&_gpuTexture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
+		sceGxmTextureSetMagFilter(&copy.Texture, TranslateFilter(_magFilter));
+		if (!copy.Strided) {
+			sceGxmTextureSetMinFilter(&copy.Texture, TranslateFilter(_minFilter));
+			sceGxmTextureSetMipFilter(&copy.Texture, SCE_GXM_TEXTURE_MIP_FILTER_DISABLED);
 			// None of these textures has a mip chain, and the level count has to say so rather than be left at
 			// whatever the init call defaulted to. It matters where a shader's texture coordinates jump between
 			// neighbouring pixels: the textured background mirrors its layer about the horizon, so the row at
 			// the fold has a derivative hundreds of times the rest of the image, and a level of detail chosen
 			// from that reaches past the only level that exists. OpenGL clamps to the base level for an
 			// incomplete chain, which is why that row is a black line here and not there.
-			sceGxmTextureSetMipmapCount(&_gpuTexture, 1);
-			sceGxmTextureSetLodBias(&_gpuTexture, 0);
+			sceGxmTextureSetMipmapCount(&copy.Texture, 1);
+			sceGxmTextureSetLodBias(&copy.Texture, 0);
 		}
 		// A linear layout - which is what every texture here has, strided or not - is documented to support
 		// fewer addressing modes than a tiled or swizzled one, and a rejected mode leaves whatever the texture
@@ -239,8 +252,8 @@ namespace nCine::RHI::GXM
 		// background that clamps instead of wrapping draws a line at the wrap, and a blur that reads past an
 		// edge picks up whatever is outside. Reported once per mode so the log says which textures wanted what.
 		const SceGxmTextureAddrMode addrMode = TranslateWrap(_wrap);
-		const std::int32_t uResult = sceGxmTextureSetUAddrMode(&_gpuTexture, addrMode);
-		const std::int32_t vResult = sceGxmTextureSetVAddrMode(&_gpuTexture, addrMode);
+		const std::int32_t uResult = sceGxmTextureSetUAddrMode(&copy.Texture, addrMode);
+		const std::int32_t vResult = sceGxmTextureSetVAddrMode(&copy.Texture, addrMode);
 
 		if (uResult < 0 || vResult < 0) {
 			static std::uint32_t reportedModes = 0;
@@ -248,28 +261,28 @@ namespace nCine::RHI::GXM
 			if ((reportedModes & modeBit) == 0) {
 				reportedModes |= modeBit;
 				LOGW("A {}x{} {} texture rejected addressing mode {} with 0x{:.8x}/0x{:.8x}, so it keeps the one "
-					"it was created with", _width, _height, _gpuStrided ? "linear-strided" : "linear",
+					"it was created with", _width, _height, copy.Strided ? "linear-strided" : "linear",
 					std::uint32_t(addrMode), std::uint32_t(uResult), std::uint32_t(vResult));
 			}
 		}
 	}
 
-	void GxmTexture::UploadPixels() const
+	void GxmTexture::UploadPixels(GpuCopy& copy) const
 	{
-		if (!_gpuBlock.IsValid() || _pixels.empty()) {
+		if (!copy.Block.IsValid() || _pixels.empty()) {
 			return;
 		}
 
-		std::uint8_t* dst = static_cast<std::uint8_t*>(_gpuBlock.Base);
+		std::uint8_t* dst = static_cast<std::uint8_t*>(copy.Block.Base);
 		const std::uint32_t rowBytes = std::uint32_t(_width) * 4u;
 		if (IsIdentitySwizzle()) {
-			if (_gpuStride == rowBytes) {
+			if (copy.Stride == rowBytes) {
 				// Same stride on both sides, so the whole image is one copy
 				std::memcpy(dst, _pixels.data(), std::size_t(rowBytes) * std::size_t(_height));
 			} else {
 				// A padded stride (a colour attachment) is filled row by row, leaving its padding untouched
 				for (std::int32_t y = 0; y < _height; y++) {
-					std::memcpy(dst + std::size_t(y) * _gpuStride, _pixels.data() + std::size_t(y) * rowBytes, rowBytes);
+					std::memcpy(dst + std::size_t(y) * copy.Stride, _pixels.data() + std::size_t(y) * rowBytes, rowBytes);
 				}
 			}
 			return;
@@ -293,7 +306,7 @@ namespace nCine::RHI::GXM
 		};
 		for (std::int32_t y = 0; y < _height; y++) {
 			const std::uint8_t* in = _pixels.data() + std::size_t(y) * rowBytes;
-			std::uint8_t* out = dst + std::size_t(y) * _gpuStride;
+			std::uint8_t* out = dst + std::size_t(y) * copy.Stride;
 			for (std::int32_t x = 0; x < _width; x++, in += 4, out += 4) {
 				out[0] = pick(_swizzle[0], in);
 				out[1] = pick(_swizzle[1], in);
@@ -305,12 +318,17 @@ namespace nCine::RHI::GXM
 
 	const SceGxmTexture* GxmTexture::GetGxmTexture() const
 	{
-		return (EnsureGpuTexture() ? &_gpuTexture : nullptr);
+		return (EnsureGpuTexture() ? &CurrentGpuCopy().Texture : nullptr);
 	}
 
 	void* GxmTexture::GetSurfaceData() const
 	{
-		return (EnsureGpuTexture() ? _gpuBlock.Base : nullptr);
+		return (EnsureGpuTexture() ? CurrentGpuCopy().Block.Base : nullptr);
+	}
+
+	std::uint32_t GxmTexture::GetSurfaceStride() const
+	{
+		return (EnsureGpuTexture() ? CurrentGpuCopy().Stride : 0);
 	}
 
 	bool GxmTexture::Bind(std::uint32_t textureUnit) const
@@ -361,7 +379,8 @@ namespace nCine::RHI::GXM
 		if (level != 0 || data == nullptr || _pixels.empty()) {
 			return;
 		}
-		if (xoffset < 0 || yoffset < 0 || xoffset + width > _width || yoffset + height > _height) {
+		if (xoffset < 0 || yoffset < 0 || width < 0 || height < 0 || xoffset > _width || yoffset > _height ||
+			width > _width - xoffset || height > _height - yoffset) {
 			return;
 		}
 
@@ -412,12 +431,13 @@ namespace nCine::RHI::GXM
 
 		// A render target's texels live only in its GPU copy, and the GPU has to be done writing them first
 		const std::uint8_t* source = _pixels.data();
-		if (_isRenderTarget && _gpuBlock.IsValid()) {
+		GpuCopy& copy = CurrentGpuCopy();
+		if (_isRenderTarget && copy.Block.IsValid()) {
 			GxmDevice::FinishScene();
 			if (SceGxmContext* context = GxmDevice::GetContext()) {
 				sceGxmFinish(context);
 			}
-			source = static_cast<const std::uint8_t*>(_gpuBlock.Base);
+			source = static_cast<const std::uint8_t*>(copy.Block.Base);
 		}
 		if (source == nullptr) {
 			return;
@@ -427,7 +447,7 @@ namespace nCine::RHI::GXM
 		const std::int32_t srcBpp = BytesPerPixel(_format);
 		// A render target's rows may be padded to the stride its colour surface needed
 		const std::size_t sourceStride = (source == _pixels.data()
-			? std::size_t(_strideBytes) : std::size_t(_gpuStride));
+			? std::size_t(_strideBytes) : std::size_t(copy.Stride));
 		std::uint8_t* dst = static_cast<std::uint8_t*>(pixels);
 		if (dstBpp == srcBpp) {
 			const std::size_t rowBytes = std::size_t(_width) * std::size_t(srcBpp);

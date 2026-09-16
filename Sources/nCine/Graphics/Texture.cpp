@@ -201,6 +201,23 @@ namespace nCine
 		return !RHI::Texture::CheckErrors();
 	}
 
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+	const std::uint8_t* Texture::GetGxmHostPixels() const
+	{
+		return _rhiTexture->GetPixels();
+	}
+
+	std::int32_t Texture::GetGxmHostStrideBytes() const
+	{
+		return _rhiTexture->GetStrideBytes();
+	}
+
+	const SwizzleChannel* Texture::GetGxmSwizzle() const
+	{
+		return _rhiTexture->GetSwizzle();
+	}
+#endif
+
 	std::uint32_t Texture::GetChannelCount() const
 	{
 		switch (_format) {

@@ -37,8 +37,15 @@ namespace nCine
 			}
 		}
 		if (fixedBatchSize > 0) {
-			minBatchSize = fixedBatchSize;
 			maxBatchSize = fixedBatchSize;
+			// Vita shaders are compiled for ten instance slots, but the actual draw count may be smaller.
+			// Requiring every compatible run to fill all ten leaves short font/UI runs as direct draws;
+			// batching two or more preserves their sorted order while reducing GXM submissions.
+#if defined(DEATH_TARGET_VITA)
+			minBatchSize = 2;
+#else
+			minBatchSize = fixedBatchSize;
+#endif
 		} else {
 			auto& renderingSettings = theApplication().GetRenderingSettings();
 			minBatchSize = renderingSettings.minBatchSize;
@@ -142,6 +149,8 @@ namespace nCine
 		FATAL_ASSERT_MSG(batchedShader != nullptr, "Unsupported shader for batch element");
 		bool commandAdded = false;
 		batchCommand = RenderResources::GetRenderCommandPool().RetrieveOrAdd(batchedShader, commandAdded);
+		// The batch command replaces the source commands at issue time, so it must retain their GXM draw label.
+		batchCommand->SetTelemetryLabel(refCommand->GetTelemetryLabel());
 
 		// Retrieving the original block instance size without the uniform buffer offset alignment
 		const RHI::UniformBlockCache* singleInstanceBlock = (*start)->GetInstanceBlock();

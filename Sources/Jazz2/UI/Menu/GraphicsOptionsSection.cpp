@@ -9,6 +9,7 @@
 #include "../../../nCine/I18n.h"
 #include "../../../nCine/Graphics/RHI/RhiFwd.h"	// RHI_CAP_POSTPROCESSING (a header macro, not a build define)
 
+#include <algorithm>
 #include <Environment.h>
 #include <Utf8.h>
 
@@ -55,6 +56,26 @@ namespace Jazz2::UI::Menu
 				return _resolutionValue;
 			},
 			nullptr);
+
+#if defined(WITH_RHI_GXM)
+		// TRANSLATORS: Menu item in Options > Graphics section
+		list->Add<ChoiceItem>(_("Rendering Resolution"),
+			[this]() -> StringView {
+				Vector2i res = theApplication().GetGfxDevice().drawableResolution();
+				_renderingResolutionValue = format("{}% ({}x{})", PreferencesCache::RenderingResolutionPercent, res.X, res.Y);
+				return _renderingResolutionValue;
+			},
+			[this](std::int32_t direction) {
+				static const std::int32_t presets[] = { 50, 75, 100 };
+				std::int32_t index = 0;
+				for (; index < 2 && PreferencesCache::RenderingResolutionPercent > presets[index]; index++) { }
+				index = std::clamp(index + direction, 0, 2);
+				PreferencesCache::RenderingResolutionPercent = presets[index];
+				PreferencesCache::ApplyRenderingResolution();
+				_root->ApplyPreferencesChanges(ChangedPreferencesType::Graphics);
+				_isDirty = true;
+			});
+#endif
 
 #if defined(NCINE_HAS_WINDOWS)
 #	if defined(DEATH_TARGET_WINDOWS_RT)
@@ -109,8 +130,9 @@ namespace Jazz2::UI::Menu
 				_isDirty = true;
 			});
 #endif
-#if defined(RHI_CAP_POSTPROCESSING) && !defined(DEATH_TARGET_VITA)
-		// Blur effects are not supported by the direct rendering tier
+#if defined(RHI_CAP_POSTPROCESSING)
+		// The direct rendering tier has no post-processing target. Vita supports the reduced two-pass chain,
+		// and can disable it to reclaim those two full-screen scenes on demanding levels.
 		// TRANSLATORS: Menu item in Options > Graphics section
 		list->Add<ChoiceItem>(_("Blur Effects"),
 			[]() -> StringView { return (PreferencesCache::BlurEffects ? _("Enabled") : _("Disabled")); },

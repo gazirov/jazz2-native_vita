@@ -116,6 +116,11 @@ namespace Jazz2::UI
 		};
 #endif
 
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		/** @brief Returns the shared palette atlas texture and the source texture's atlas region */
+		Texture* GetPaletteAtlasTexture(const Texture& source, Recti& sourceRegion);
+#endif
+
 		/** @{ @name Constants */
 
 		/** @brief Main layer */
@@ -146,7 +151,22 @@ namespace Jazz2::UI
 		float _gemsTime;
 		std::uint8_t _gemsLastType;
 		float _activeBossTime;
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		struct PaletteAtlasEntry
+		{
+			const Texture* Source = nullptr;
+			Recti Region;
+		};
+		static constexpr std::uint32_t PaletteAtlasSize = 512;
+		static constexpr std::uint32_t PaletteAtlasEntryCount = 32;
+		std::unique_ptr<Texture> _paletteAtlas;
+		PaletteAtlasEntry _paletteAtlasEntries[PaletteAtlasEntryCount] = {};
+		std::uint32_t _paletteAtlasEntryCount = 0;
+		std::int32_t _paletteAtlasNextX = 0;
+		std::int32_t _paletteAtlasNextY = 0;
+		std::int32_t _paletteAtlasRowHeight = 0;
 #endif
+	#endif
 
 		/** @brief Called when some overview information of the player needs to be drawn */
 		virtual void OnDrawOverview(const Rectf& view, const Rectf& adjustedView, Actors::Player* player);

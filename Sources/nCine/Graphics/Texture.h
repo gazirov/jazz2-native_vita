@@ -120,6 +120,14 @@ namespace nCine
 		bool SaveToMemory(std::uint8_t* bufferPtr);
 		/** @brief Saves all texels of the specified MIP level in raw format to a memory buffer */
 		bool SaveToMemory(std::uint8_t* bufferPtr, std::int32_t level);
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		/** @brief Returns the host-side promoted RGBA texels used by the native GXM texture */
+		const std::uint8_t* GetGxmHostPixels() const;
+		/** @brief Returns the byte distance between rows in the native GXM host store */
+		std::int32_t GetGxmHostStrideBytes() const;
+		/** @brief Returns the channel swizzle applied by the native GXM sampler */
+		const SwizzleChannel* GetGxmSwizzle() const;
+#endif
 
 		/** @brief Returns the texture width */
 		inline std::int32_t GetWidth() const {

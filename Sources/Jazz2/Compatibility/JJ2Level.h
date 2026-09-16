@@ -244,8 +244,8 @@ namespace Jazz2::Compatibility
 		void LoadStaticTileData(JJ2Block& block, bool strictParser);
 		void LoadAnimatedTiles(JJ2Block& block, bool strictParser);
 		void LoadLayerMetadata(JJ2Block& block, bool strictParser);
-		void LoadEvents(JJ2Block& block, bool strictParser);
-		void LoadLayers(JJ2Block& dictBlock, std::int32_t dictLength, JJ2Block& layoutBlock, bool strictParser);
+		bool LoadEvents(JJ2Block& block, bool strictParser);
+		bool LoadLayers(JJ2Block& dictBlock, std::int32_t dictLength, JJ2Block& layoutBlock, bool strictParser);
 		void LoadMlleData(JJ2Block& block, std::uint32_t version, StringView path, bool strictParser);
 		void CheckWaterLevelAroundStart();
 

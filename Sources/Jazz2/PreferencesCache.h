@@ -291,6 +291,8 @@ namespace Jazz2
 		static bool BlurEffects;
 		/** @brief Lighting resolution percent */
 		static std::uint8_t LightingResolutionPercent;
+		/** @brief Rendering resolution percent */
+		static std::uint8_t RenderingResolutionPercent;
 
 		// Gameplay
 		/** @brief Whether reforged gameplay is enabled */
@@ -386,6 +388,8 @@ namespace Jazz2
 		static void Initialize(AppConfiguration& config);
 		/** @brief Serializes current preferences to file */
 		static void Save();
+		/** @brief Applies the rendering resolution to the Vita's intermediate screen surface */
+		static void ApplyRenderingResolution();
 		/** @brief Returns directory path of the preferences file */
 		static StringView GetDirectory();
 
@@ -448,7 +452,7 @@ namespace Jazz2
 
 		DEATH_PRIVATE_ENUM_FLAGS(BoolOptions);
 
-		static constexpr std::uint8_t FileVersion = 15;
+		static constexpr std::uint8_t FileVersion = 16;
 
 		PreferencesCache(const PreferencesCache&) = delete;
 		PreferencesCache& operator=(const PreferencesCache&) = delete;

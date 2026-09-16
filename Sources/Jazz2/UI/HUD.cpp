@@ -13,6 +13,10 @@
 #include "../../nCine/I18n.h"
 #include "../../nCine/Graphics/RenderQueue.h"
 
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+#	include <cstring>
+#endif
+
 #if defined(DEATH_TARGET_ANDROID)
 #	include "../../nCine/Backends/Android/AndroidApplication.h"
 #endif
@@ -107,6 +111,86 @@ namespace Jazz2::UI
 		}
 #endif
 	}
+
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+	Texture* HUD::GetPaletteAtlasTexture(const Texture& source, Recti& sourceRegion)
+	{
+		for (std::uint32_t i = 0; i < _paletteAtlasEntryCount; i++) {
+			if (_paletteAtlasEntries[i].Source == &source) {
+				sourceRegion = _paletteAtlasEntries[i].Region;
+				return _paletteAtlas.get();
+			}
+		}
+
+		const std::int32_t width = source.GetWidth();
+		const std::int32_t height = source.GetHeight();
+		const std::int32_t stride = source.GetGxmHostStrideBytes();
+		const std::uint8_t* pixels = source.GetGxmHostPixels();
+		constexpr std::int32_t padding = 1;
+		if (width <= 0 || height <= 0 || pixels == nullptr || stride < width * 4 || width + padding * 2 > PaletteAtlasSize ||
+			height + padding * 2 > PaletteAtlasSize || _paletteAtlasEntryCount >= PaletteAtlasEntryCount) {
+			return nullptr;
+		}
+
+		const std::int32_t packedWidth = width + padding * 2;
+		const std::int32_t packedHeight = height + padding * 2;
+		if (_paletteAtlas == nullptr) {
+			_paletteAtlas = std::make_unique<Texture>("HudPaletteAtlas", Texture::Format::RGBA8, PaletteAtlasSize, PaletteAtlasSize);
+			std::unique_ptr<std::uint8_t[]> clearPixels(new std::uint8_t[PaletteAtlasSize * PaletteAtlasSize * 4]());
+			if (!_paletteAtlas->LoadFromTexels(clearPixels.get())) {
+				_paletteAtlas.reset();
+				return nullptr;
+			}
+			_paletteAtlas->SetMinFiltering(SamplerFilter::Nearest);
+			_paletteAtlas->SetMagFiltering(SamplerFilter::Nearest);
+			_paletteAtlas->SetWrap(SamplerWrapping::ClampToEdge);
+		}
+
+		if (_paletteAtlasNextX + packedWidth > PaletteAtlasSize) {
+			_paletteAtlasNextX = 0;
+			_paletteAtlasNextY += _paletteAtlasRowHeight;
+			_paletteAtlasRowHeight = 0;
+		}
+		if (_paletteAtlasNextY + packedHeight > PaletteAtlasSize) {
+			return nullptr;
+		}
+
+		std::unique_ptr<std::uint8_t[]> regionPixels(new std::uint8_t[std::size_t(packedWidth) * packedHeight * 4]());
+		const SwizzleChannel* swizzle = source.GetGxmSwizzle();
+		auto swizzled = [swizzle](SwizzleChannel channel, const std::uint8_t* texel) -> std::uint8_t {
+			switch (channel) {
+				case SwizzleChannel::Red: return texel[0];
+				case SwizzleChannel::Green: return texel[1];
+				case SwizzleChannel::Blue: return texel[2];
+				case SwizzleChannel::Alpha: return texel[3];
+				case SwizzleChannel::Zero: return 0;
+				case SwizzleChannel::One: return 255;
+				default: return texel[0];
+			}
+		};
+		for (std::int32_t y = 0; y < height; y++) {
+			const std::uint8_t* sourceRow = pixels + std::size_t(y) * stride;
+			std::uint8_t* destinationRow = regionPixels.get() + std::size_t(y + padding) * packedWidth * 4 + padding * 4;
+			for (std::int32_t x = 0; x < width; x++) {
+				const std::uint8_t* sourceTexel = sourceRow + std::size_t(x) * 4;
+				std::uint8_t* destinationTexel = destinationRow + std::size_t(x) * 4;
+				for (std::uint32_t channel = 0; channel < 4; channel++) {
+					destinationTexel[channel] = swizzled(swizzle[channel], sourceTexel);
+				}
+			}
+		}
+		if (!_paletteAtlas->LoadFromTexels(regionPixels.get(), _paletteAtlasNextX, _paletteAtlasNextY, packedWidth, packedHeight)) {
+			return nullptr;
+		}
+
+		const Recti region(_paletteAtlasNextX + padding, _paletteAtlasNextY + padding, width, height);
+		_paletteAtlasEntries[_paletteAtlasEntryCount++] = { &source, region };
+		_paletteAtlasNextX += packedWidth;
+		_paletteAtlasRowHeight = std::max(_paletteAtlasRowHeight, packedHeight);
+		sourceRegion = region;
+		return _paletteAtlas.get();
+	}
+#endif
 
 	void HUD::OnUpdate(float timeMult)
 	{
@@ -1138,6 +1222,15 @@ namespace Jazz2::UI
 
 	void HUD::DrawElement(AnimState state, std::int32_t frame, float x, float y, std::uint16_t z, Alignment align, const Colorf& color, float scaleX, float scaleY, bool additiveBlending, float angle)
 	{
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		// Route ordinary indexed HUD elements through the atlas path too. Keep unusual additive/rotated draws on
+		// the original path because their blending/order semantics are not interchangeable with this helper.
+		if (_metadataIndexed != nullptr && !additiveBlending && std::abs(angle) <= 0.01f) {
+			if (DrawElementWithPalette(state, frame, x, y, z, align, color, 0.0f, scaleX, scaleY)) {
+				return;
+			}
+		}
+#endif
 		auto* res = _metadata->FindAnimation(state);
 		if (res == nullptr) {
 			return;
@@ -1203,6 +1296,16 @@ namespace Jazz2::UI
 
 		Vector2i texSize = base->TextureDiffuse->GetSize();
 		Recti frameRect = base->GetFrameRect(frame);
+		Texture* drawTexture = base->TextureDiffuse.get();
+#if defined(DEATH_TARGET_VITA) && defined(WITH_RHI_GXM)
+		Recti atlasRegion;
+		if (Texture* atlas = GetPaletteAtlasTexture(*drawTexture, atlasRegion)) {
+			frameRect.X += atlasRegion.X;
+			frameRect.Y += atlasRegion.Y;
+			texSize = atlas->GetSize();
+			drawTexture = atlas;
+		}
+#endif
 		// A trimmed frame covers less than its cell, so it keeps the cell's alignment and shifts
 		// into place instead of being stretched over the whole cell
 		Vector2i frameOffset = base->GetFrameOffset(frame);
@@ -1242,7 +1345,7 @@ namespace Jazz2::UI
 
 		command->SetTransformation(Matrix4x4f::Translation(adjustedPos.X, adjustedPos.Y, 0.0f));
 		command->SetLayer(z);
-		command->GetMaterial().SetTexture(0, *base->TextureDiffuse.get());
+		command->GetMaterial().SetTexture(0, *drawTexture);
 		command->GetMaterial().SetTexture(1, *palette);
 
 		DrawRenderCommand(command);

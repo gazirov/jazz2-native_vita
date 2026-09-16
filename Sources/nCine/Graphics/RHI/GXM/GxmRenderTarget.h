@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+#include <Containers/String.h>
 #include <Containers/StringView.h>
 
 #include <psp2/gxm.h>
@@ -114,8 +115,12 @@ namespace nCine::RHI::GXM
 		/** @brief Hints that the depth/stencil contents are no longer needed (no-op: they are never stored) */
 		void InvalidateDepthStencil(DepthStencilFormat format);
 
-		/** @brief Sets a debug label for the render target (ignored) */
+		/** @brief Sets a debug label used by GXM performance telemetry */
 		void SetObjectLabel(StringView label);
+		/** @brief Returns the persistent debug label, or an empty string when unnamed */
+		inline const char* GetObjectLabel() const {
+			return _label.data();
+		}
 
 		/** @brief Returns the texture attached at the given colour attachment index, or `nullptr` */
 		inline GxmTexture* GetColorTexture(std::uint32_t index) const {
@@ -144,16 +149,22 @@ namespace nCine::RHI::GXM
 	private:
 		GxmTexture* _colorTextures[MaxColorAttachments];
 		std::uint32_t _numDrawBuffers;
+		String _label;
 
-		// The sceGxm objects describing the current attachment, rebuilt when it changes
+		// One tiling descriptor serves all same-size copies; colour surfaces and sync objects are frame-owned.
 		SceGxmRenderTarget* _gxmRenderTarget;
-		SceGxmColorSurface _colorSurface;
-		SceGxmSyncObject* _syncObject;		// serializes writing these texels against sampling them
-		GxmTexture* _surfaceTexture;		// the texture _colorSurface was built over (to detect a change)
-		void* _surfaceData;					// its GPU address at that point (a reallocation invalidates the surface)
-		std::int32_t _surfaceWidth;
-		std::int32_t _surfaceHeight;
-		bool _surfaceValid;
+		static constexpr std::uint32_t FrameSlotCount = 3;
+		struct SurfaceSlot
+		{
+			SceGxmColorSurface ColorSurface = {};
+			SceGxmSyncObject* SyncObject = nullptr;
+			void* SurfaceData = nullptr;
+			std::int32_t Width = 0;
+			std::int32_t Height = 0;
+			bool Valid = false;
+		};
+		SurfaceSlot _surfaceSlots[FrameSlotCount];
+		GxmTexture* _surfaceTexture;
 
 		/** @brief Releases the sceGxm render target and invalidates the colour surface */
 		void ReleaseSceneTarget();

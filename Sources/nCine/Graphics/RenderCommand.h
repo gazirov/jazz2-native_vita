@@ -97,6 +97,10 @@ namespace nCine
 		inline void SetTelemetryLabel(const char* label) {
 			_telemetryLabel = label;
 		}
+		/** @brief Returns the optional backend telemetry label for this draw */
+		inline const char* GetTelemetryLabel() const {
+			return _telemetryLabel;
+		}
 
 		/** @brief Binds the command state and issues the draw call */
 		void Issue();

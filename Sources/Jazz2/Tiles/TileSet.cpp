@@ -2,11 +2,23 @@
 
 #include <cstring>
 
+#if defined(DEATH_TARGET_VITA)
+#	include "../../nCine/Graphics/RHI/GXM/GxmDevice.h"
+#endif
+
 namespace Jazz2::Tiles
 {
-	TileSet::TileSet(StringView path, std::uint16_t tileCount, SmallVector<std::unique_ptr<Texture>, 1>&& textureDiffuse, std::unique_ptr<uint8_t[]> mask, std::uint32_t maskSize, std::unique_ptr<Color[]> captionTile, const std::uint8_t* tileDiffuseOpaque)
+	TileSet::TileSet(StringView path, std::uint16_t tileCount, SmallVector<std::unique_ptr<Texture>, 1>&& textureDiffuse,
+		std::unique_ptr<uint8_t[]> mask, std::uint32_t maskSize, std::unique_ptr<Color[]> captionTile, const std::uint8_t* tileDiffuseOpaque
+#if defined(DEATH_TARGET_VITA)
+		, SmallVector<Array<std::uint8_t>, 1>&& indexedDiffuseTexels
+#endif
+	)
 		: FilePath(path), TextureDiffuse(std::move(textureDiffuse)), _mask(std::move(mask)), _captionTile(std::move(captionTile)),
 			_isMaskEmpty(), _isMaskFilled(), _isTileFilled(), _isColumnContiguous()
+#if defined(DEATH_TARGET_VITA)
+			, _indexedDiffuseTexels(std::move(indexedDiffuseTexels)), _bakedDiffuse()
+#endif
 	{
 		// TilesPerRow/TilesPerTexture are used only for rendering. Every chunk shares the layout of chunk 0
 		// (the last one may be shorter), so its size defines how many tiles each chunk covers.
@@ -101,6 +113,76 @@ namespace Jazz2::Tiles
 		}
 	}
 
+#if defined(DEATH_TARGET_VITA)
+	Texture* TileSet::GetBakedDiffuse(std::int32_t chunk, std::uint16_t paletteOffset, ArrayView<const std::uint32_t> palettes,
+		BakedDiffuseFailure* failure)
+	{
+		if (failure != nullptr) {
+			*failure = BakedDiffuseFailure::None;
+		}
+		if (!IsIndexed || chunk < 0 || chunk >= std::int32_t(TextureDiffuse.size()) || chunk >= std::int32_t(_indexedDiffuseTexels.size()) ||
+			TextureDiffuse[chunk] == nullptr || paletteOffset + 256u > palettes.size()) {
+			if (failure != nullptr) {
+				*failure = BakedDiffuseFailure::InvalidSource;
+			}
+			return nullptr;
+		}
+
+		BakedDiffuse* baked = nullptr;
+		for (BakedDiffuse& candidate : _bakedDiffuse) {
+			if (candidate.PaletteOffset == paletteOffset) {
+				baked = &candidate;
+				break;
+			}
+		}
+		if (baked == nullptr) {
+			baked = &_bakedDiffuse.emplace_back();
+			baked->PaletteOffset = paletteOffset;
+		}
+
+		const std::uint32_t* palette = palettes.data() + paletteOffset;
+		if (baked->Textures.empty() || std::memcmp(baked->Palette.data(), palette, baked->Palette.size() * sizeof(std::uint32_t)) != 0) {
+			baked->Textures.clear();
+			std::memcpy(baked->Palette.data(), palette, baked->Palette.size() * sizeof(std::uint32_t));
+			for (std::int32_t i = 0; i < std::int32_t(TextureDiffuse.size()); i++) {
+				const Vector2i size = TextureDiffuse[i]->GetSize();
+				const std::size_t texelCount = std::size_t(size.X) * size.Y;
+				const Array<std::uint8_t>& indices = _indexedDiffuseTexels[i];
+				if (indices.size() != texelCount) {
+					baked->Textures.clear();
+					if (failure != nullptr) {
+						*failure = BakedDiffuseFailure::MissingIndexedTexels;
+					}
+					return nullptr;
+				}
+
+				Array<std::uint8_t> texels(NoInit, texelCount * 4);
+				for (std::size_t texel = 0; texel < texelCount; texel++) {
+					const std::uint32_t color = palette[indices[texel]];
+					texels[texel * 4 + 0] = std::uint8_t(color >> 0);
+					texels[texel * 4 + 1] = std::uint8_t(color >> 8);
+					texels[texel * 4 + 2] = std::uint8_t(color >> 16);
+					texels[texel * 4 + 3] = std::uint8_t(color >> 24);
+				}
+
+				auto texture = std::make_unique<Texture>(FilePath.data(), Texture::Format::RGBA8, size.X, size.Y);
+				if (!texture->LoadFromTexels(texels.data(), 0, 0, size.X, size.Y)) {
+					baked->Textures.clear();
+					if (failure != nullptr) {
+						*failure = BakedDiffuseFailure::TextureUpload;
+					}
+					return nullptr;
+				}
+				texture->SetMinFiltering(SamplerFilter::Nearest);
+				texture->SetMagFiltering(SamplerFilter::Nearest);
+				baked->Textures.push_back(std::move(texture));
+			}
+		}
+
+		return (chunk < std::int32_t(baked->Textures.size()) ? baked->Textures[chunk].get() : nullptr);
+	}
+#endif
+
 	bool TileSet::OverrideTileDiffuse(std::int32_t tileId, StaticArrayView<(DefaultTileSize + 2) * (DefaultTileSize + 2), std::uint32_t> tileDiffuse)
 	{
 		if (tileId >= TileCount) {
@@ -108,11 +190,32 @@ namespace Jazz2::Tiles
 		}
 
 		// The tile may live in any texture chunk when the atlas was split by the device texture-size limit
+		const std::int32_t textureChunk = (TilesPerTexture > 0 ? tileId / TilesPerTexture : 0);
 		std::int32_t localTileId = tileId;
 		Texture* texture = ResolveTextureDiffuse(localTileId);
 		if (texture == nullptr) {
 			return false;
 		}
+
+#if defined(DEATH_TARGET_VITA)
+		if (IsIndexed && textureChunk < std::int32_t(_indexedDiffuseTexels.size())) {
+			// Level-cache overrides for indexed tiles retain their palette index in red and use alpha only for
+			// transparency. Update the retained atlas so the next baked palette variant includes this tile.
+			const Vector2i textureSize = texture->GetSize();
+			Array<std::uint8_t>& indices = _indexedDiffuseTexels[textureChunk];
+			const std::int32_t x = (localTileId % TilesPerRow) * (DefaultTileSize + 2);
+			const std::int32_t y = (localTileId / TilesPerRow) * (DefaultTileSize + 2);
+			if (indices.size() == std::size_t(textureSize.X) * textureSize.Y) {
+				for (std::int32_t row = 0; row < DefaultTileSize + 2; row++) {
+					for (std::int32_t column = 0; column < DefaultTileSize + 2; column++) {
+						const std::uint32_t color = tileDiffuse[row * (DefaultTileSize + 2) + column];
+						indices[(y + row) * textureSize.X + x + column] = ((color >> 24) != 0 ? std::uint8_t(color) : 0);
+					}
+				}
+				_bakedDiffuse.clear();
+			}
+		}
+#endif
 
 		std::int32_t x = (localTileId % TilesPerRow) * (DefaultTileSize + 2);
 		std::int32_t y = (localTileId / TilesPerRow) * (DefaultTileSize + 2);

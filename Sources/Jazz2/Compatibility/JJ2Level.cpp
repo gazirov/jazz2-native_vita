@@ -13,6 +13,8 @@
 #include <IO/FileSystem.h>
 #include <IO/Compression/DeflateStream.h>
 
+#include <limits>
+
 using namespace Death::Containers::Literals;
 using namespace Death::IO;
 using namespace Death::IO::Compression;
@@ -34,6 +36,9 @@ namespace Jazz2::Compatibility
 		StringUtils::lowercaseInPlace(LevelName);
 
 		JJ2Block headerBlock(s, 262 - 180);
+		if (!headerBlock.IsValid()) {
+			return false;
+		}
 
 		std::uint32_t magic = headerBlock.ReadUInt32();
 		DEATH_ASSERT(magic == 0x4C56454C /*LEVL*/, "Invalid magic string", false);
@@ -76,10 +81,14 @@ namespace Jazz2::Compatibility
 		JJ2Block eventBlock(s, eventBlockPackedSize, eventBlockUnpackedSize);
 		JJ2Block dictBlock(s, dictBlockPackedSize, dictBlockUnpackedSize);
 		JJ2Block layoutBlock(s, layoutBlockPackedSize, layoutBlockUnpackedSize);
+		if (!infoBlock.IsValid() || !eventBlock.IsValid() || !dictBlock.IsValid() || !layoutBlock.IsValid()) {
+			return false;
+		}
 
 		LoadMetadata(infoBlock, strictParser);
-		LoadEvents(eventBlock, strictParser);
-		LoadLayers(dictBlock, dictBlockUnpackedSize / 8, layoutBlock, strictParser);
+		if (!LoadEvents(eventBlock, strictParser) || !LoadLayers(dictBlock, dictBlockUnpackedSize / 8, layoutBlock, strictParser)) {
+			return false;
+		}
 
 		// Try to read MLLE data stream
 		std::uint32_t mlleMagic = s->ReadValueAsLE<std::uint32_t>();
@@ -89,6 +98,9 @@ namespace Jazz2::Compatibility
 			std::int32_t mlleBlockUnpackedSize = s->ReadValueAsLE<std::int32_t>();
 
 			JJ2Block mlleBlock(s, mlleBlockPackedSize, mlleBlockUnpackedSize);
+			if (!mlleBlock.IsValid()) {
+				return false;
+			}
 			LoadMlleData(mlleBlock, mlleVersion, path, strictParser);
 		}
 
@@ -257,15 +269,21 @@ namespace Jazz2::Compatibility
 		}
 	}
 
-	void JJ2Level::LoadEvents(JJ2Block& block, bool strictParser)
+	bool JJ2Level::LoadEvents(JJ2Block& block, bool strictParser)
 	{
+		static_cast<void>(strictParser);
 		std::int32_t width = _layers[3].Width;
 		std::int32_t height = _layers[3].Height;
-		if (width <= 0 && height <= 0) {
-			return;
+		if (width <= 0 || height <= 0) {
+			return true;
 		}
+		const std::uint64_t area64 = std::uint64_t(width) * std::uint64_t(height);
+		if (area64 > std::numeric_limits<std::size_t>::max() || area64 > std::uint64_t(block.GetLength()) / sizeof(std::uint32_t)) {
+			return false;
+		}
+		const std::size_t area = std::size_t(area64);
 
-		_events = std::make_unique<TileEventSection[]>(width * height);
+		_events = std::make_unique<TileEventSection[]>(area);
 
 		for (std::int32_t y = 0; y < _layers[3].Height; y++) {
 			for (std::int32_t x = 0; x < width; x++) {
@@ -279,7 +297,7 @@ namespace Jazz2::Compatibility
 			}
 		}
 
-		auto& lastTileEvent = _events[(width * height) - 1];
+		auto& lastTileEvent = _events[area - 1];
 		if (lastTileEvent.EventType == JJ2Event::MODIFIER_ONE_WAY) {
 			_hasPit = false;
 			_hasPitInstantDeath = false;
@@ -291,7 +309,7 @@ namespace Jazz2::Compatibility
 			_hasPitInstantDeath = false;
 		}
 
-		for (std::int32_t i = 0; i < width * height; i++) {
+		for (std::size_t i = 0; i < area; i++) {
 			if (_events[i].EventType == JJ2Event::CTF_BASE) {
 				_hasCTF = true;
 			} else if (_events[i].EventType == JJ2Event::WARP_ORIGIN) {
@@ -300,14 +318,19 @@ namespace Jazz2::Compatibility
 				}
 			}
 		}
+		return !block.ReachedEndOfStream();
 	}
 
-	void JJ2Level::LoadLayers(JJ2Block& dictBlock, std::int32_t dictLength, JJ2Block& layoutBlock, bool strictParser)
+	bool JJ2Level::LoadLayers(JJ2Block& dictBlock, std::int32_t dictLength, JJ2Block& layoutBlock, bool strictParser)
 	{
+		static_cast<void>(strictParser);
 		struct DictionaryEntry {
 			std::uint16_t Tiles[4];
 		};
 
+		if (dictLength < 0 || std::size_t(dictLength) > std::size_t(dictBlock.GetLength()) / sizeof(DictionaryEntry)) {
+			return false;
+		}
 		std::unique_ptr<DictionaryEntry[]> dictionary = std::make_unique<DictionaryEntry[]>(dictLength);
 		for (std::int32_t i = 0; i < dictLength; i++) {
 			auto& entry = dictionary[i];
@@ -316,15 +339,40 @@ namespace Jazz2::Compatibility
 			}
 		}
 
+		std::uint64_t requiredLayoutEntries = 0;
+		for (std::int32_t i = 0; i < JJ2LayerCount; i++) {
+			const auto& layer = _layers[i];
+			if (layer.Width < 0 || layer.InternalWidth < 0 || layer.Height < 0 || layer.Width > layer.InternalWidth) {
+				return false;
+			}
+			if (layer.Used) {
+				const std::uint64_t entries = std::uint64_t(layer.Height) * ((std::uint64_t(layer.InternalWidth) + 3) / 4);
+				if (entries > std::numeric_limits<std::size_t>::max() || requiredLayoutEntries > std::numeric_limits<std::uint64_t>::max() - entries) {
+					return false;
+				}
+				requiredLayoutEntries += entries;
+			}
+		}
+		if (requiredLayoutEntries > std::uint64_t(layoutBlock.GetLength()) / sizeof(std::uint16_t)) {
+			return false;
+		}
+
 		for (std::int32_t i = 0; i < JJ2LayerCount; i++) {
 			auto& layer = _layers[i];
 
 			if (layer.Used) {
-				layer.Tiles = std::make_unique<std::uint16_t[]>(layer.InternalWidth * layer.Height);
+				const std::uint64_t tileCount64 = std::uint64_t(layer.InternalWidth) * std::uint64_t(layer.Height);
+				if (tileCount64 > std::numeric_limits<std::size_t>::max()) {
+					return false;
+				}
+				layer.Tiles = std::make_unique<std::uint16_t[]>(std::size_t(tileCount64));
 
 				for (std::int32_t y = 0; y < layer.Height; y++) {
 					for (std::int32_t x = 0; x < layer.InternalWidth; x += 4) {
-						std::uint16_t dictIdx = layoutBlock.ReadUInt16();
+					std::uint16_t dictIdx = layoutBlock.ReadUInt16();
+					if (dictIdx >= dictLength) {
+						return false;
+					}
 
 						for (std::int32_t j = 0; j < 4; j++) {
 							if (j + x >= layer.Width) {
@@ -337,9 +385,14 @@ namespace Jazz2::Compatibility
 				}
 			} else {
 				// Array will be initialized with zeros
-				layer.Tiles = std::make_unique<std::uint16_t[]>(layer.Width * layer.Height);
+				const std::uint64_t tileCount64 = std::uint64_t(layer.Width) * std::uint64_t(layer.Height);
+				if (tileCount64 > std::numeric_limits<std::size_t>::max()) {
+					return false;
+				}
+				layer.Tiles = std::make_unique<std::uint16_t[]>(std::size_t(tileCount64));
 			}
 		}
+		return !dictBlock.ReachedEndOfStream() && !layoutBlock.ReachedEndOfStream();
 	}
 
 	void JJ2Level::LoadMlleData(JJ2Block& block, std::uint32_t version, StringView path, bool strictParser)

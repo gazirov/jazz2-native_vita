@@ -171,6 +171,8 @@ namespace nCine::RHI::GXM
 			presentation, or a resource the open scene still references going away.
 		*/
 		static void FinishScene();
+		/** @brief Ends the current scene and waits until every submitted scene has finished reading GPU-visible memory */
+		static void WaitForGpuIdle();
 
 		struct Telemetry
 		{
@@ -183,18 +185,72 @@ namespace nCine::RHI::GXM
 				std::uint64_t WaitMicroseconds = 0;
 				std::uint64_t PresentFinishMicroseconds = 0;
 			};
+			struct DependencyWait
+			{
+				const char* ProducerProgram = nullptr;
+				char ProducerTargetLabel[32] = {};
+				const char* ConsumerProgram = nullptr;
+				const char* ConsumerLabel = nullptr;
+				std::uint32_t ProducerTargetId = 0;
+				std::int32_t ProducerWidth = 0;
+				std::int32_t ProducerHeight = 0;
+				std::uint32_t Count = 0;
+				std::uint64_t WaitMicroseconds = 0;
+			};
+			struct TargetShaderDraw
+			{
+				char TargetLabel[32] = {};
+				const char* ProgramName = nullptr;
+				std::uint32_t TargetId = 0;
+				std::uint32_t Calls = 0;
+				std::uint64_t Indices = 0;
+			};
 
 			static constexpr std::uint32_t MaxShaderDraws = 24;
+			static constexpr std::uint32_t MaxDependencyWaits = 16;
+			static constexpr std::uint32_t MaxTargetShaderDraws = 48;
 			std::uint32_t SceneBegins = 0;
 			std::uint32_t SceneFinishes = 0;
 			std::uint32_t NotificationWaits = 0;
+			std::uint32_t TargetSwitches = 0;
+			std::uint32_t DependencyWaits = 0;
+			std::uint32_t RingSlotWaits = 0;
+			std::uint32_t PresentDependencyWaits = 0;
 			std::uint32_t Presents = 0;
 			std::uint64_t NotificationWaitMicroseconds = 0;
+			std::uint64_t DependencyWaitMicroseconds = 0;
+			std::uint64_t RingSlotWaitMicroseconds = 0;
+			std::uint64_t PresentDependencyWaitMicroseconds = 0;
 			std::uint64_t FinishMicroseconds = 0;
+			std::uint32_t FrameNotificationChecks = 0;
+			std::uint32_t FrameNotificationFailures = 0;
+			std::uint32_t ContextSlotRotations = 0;
+			std::uint32_t LightsEmitted = 0;
+			std::uint32_t LightsVisible = 0;
+			std::uint32_t LightsMerged = 0;
+			std::uint32_t LightsDropped = 0;
+			std::uint64_t LightEmitMicroseconds = 0;
+			std::uint64_t LightCullSortMicroseconds = 0;
+			std::uint64_t LightMergeMicroseconds = 0;
+			std::uint64_t LightGeometryMicroseconds = 0;
+			std::uint32_t TileBakeInvalidSource = 0;
+			std::uint32_t TileBakeMissingTexels = 0;
+			std::uint32_t TileBakeUploadFailures = 0;
+			std::uint32_t TileBakeRebuilds = 0;
+			std::uint32_t TileBakeTextures = 0;
+			std::uint64_t TileBakeBytes = 0;
 			ShaderDraw ShaderDraws[MaxShaderDraws];
+			DependencyWait DependencyWaitsByPass[MaxDependencyWaits];
+			TargetShaderDraw TargetShaderDraws[MaxTargetShaderDraws];
 		};
 		/** @brief Returns and clears the lightweight counters collected since the previous call */
 		static Telemetry GetAndResetTelemetry();
+		/** @brief Number of resource copies that protect frames submitted to the display queue */
+		static constexpr std::uint32_t FrameSlotCount = 3;
+		/** @brief Slot the render thread is currently recording into */
+		static std::uint32_t GetCurrentFrameSlot();
+		/** @brief Bytes an additional in-flight frame needs for its GXM context rings and screen/depth surfaces */
+		static std::uint32_t GetFrameSlotBaseBytes();
 
 		/** @brief Returns the shader patcher every program creates its vertex/fragment programs through */
 		static SceGxmShaderPatcher* GetShaderPatcher();
@@ -228,8 +284,8 @@ namespace nCine::RHI::GXM
 
 			@param windowHandle Ignored (the Vita has one fixed display, so there is no window to attach to);
 			                    accepted only to keep the uniform swap-chain contract of the other backends
-			@param width        Ignored, the panel is always 960x544
-			@param height       Ignored
+			@param width        Width of the intermediate screen surface, clamped to the panel
+			@param height       Height of the intermediate screen surface, clamped to the panel
 			@param vsync        Whether @ref PresentFrame() waits for the display swap to be picked up
 			@returns `true` if sceGxm, the context, the surfaces and the built-in shaders all came up
 		*/
@@ -238,6 +294,10 @@ namespace nCine::RHI::GXM
 		static void DestroySwapchain();
 		/** @brief No-op: the panel resolution is fixed (the logical resolution is a render-target size, not a swap-chain one) */
 		static void ResizeSwapchain(std::int32_t width, std::int32_t height);
+		/** @brief Recreates the intermediate screen surfaces at a new size */
+		static bool ResizeScreenSurface(std::int32_t width, std::int32_t height);
+		static std::int32_t GetScreenWidth() { return _screenWidth; }
+		static std::int32_t GetScreenHeight() { return _screenHeight; }
 		/** @brief Flips the intermediate screen surface into the next display buffer and queues it for scan-out */
 		static void PresentFrame();
 
@@ -333,15 +393,24 @@ namespace nCine::RHI::GXM
 
 		static SceGxmContext* _context;
 		static SceGxmShaderPatcher* _shaderPatcher;
-		// One render target covers both the intermediate screen surface and the display buffers: they share
-		// the panel's dimensions, and a sceGxmRenderTarget only describes the tiling of a size, not a surface
 		static SceGxmRenderTarget* _displayRenderTarget;
+		static SceGxmRenderTarget* _screenRenderTarget;
+		static std::int32_t _screenWidth;
+		static std::int32_t _screenHeight;
 
-		static GxmMemory::Block _contextHostMem;
-		static GxmMemory::Block _vdmRingBuffer;
-		static GxmMemory::Block _vertexRingBuffer;
-		static GxmMemory::Block _fragmentRingBuffer;
-		static GxmMemory::Block _fragmentUsseRingBuffer;
+		// A context owns its command and default-uniform rings. They are rotated after the present barrier now,
+		// which validates their independent lifetime before the next stage removes that barrier.
+		struct ContextSlot
+		{
+			SceGxmContext* Context = nullptr;
+			GxmMemory::Block HostMem;
+			GxmMemory::Block VdmRingBuffer;
+			GxmMemory::Block VertexRingBuffer;
+			GxmMemory::Block FragmentRingBuffer;
+			GxmMemory::Block FragmentUsseRingBuffer;
+		};
+		static ContextSlot _contextSlots[FrameSlotCount];
+		static std::uint32_t _currentFrameSlot;
 		static GxmMemory::Block _patcherBufferMem;
 		static GxmMemory::Block _patcherVertexUsseMem;
 		static GxmMemory::Block _patcherFragmentUsseMem;
@@ -352,16 +421,18 @@ namespace nCine::RHI::GXM
 		static std::uint32_t _backBufferIndex;
 		static std::uint32_t _frontBufferIndex;
 
-		// The intermediate surface every draw that is not aimed at a render target lands in, kept bottom-up
-		// like OpenGL and flipped into the display buffer at present time (see the class documentation)
-		static GxmMemory::Block _screenBuffer;
-		static SceGxmColorSurface _screenSurface;
-		static SceGxmTexture _screenTexture;
-		// Serializes the frame's writes to the screen surface against the present blit that samples them
-		static SceGxmSyncObject* _screenSyncObject;
-
-		static GxmMemory::Block _depthBuffer;
-		static SceGxmDepthStencilSurface _depthSurface;
+		// The screen and depth surfaces are frame-owned just like the context rings. Unlike viewport targets,
+		// they are cleared and fully redrawn every frame, so no persistent content has to be copied between slots.
+		struct FrameSurfaceSlot
+		{
+			GxmMemory::Block ScreenBuffer;
+			SceGxmColorSurface ScreenSurface = {};
+			SceGxmTexture ScreenTexture = {};
+			SceGxmSyncObject* ScreenSyncObject = nullptr;
+			GxmMemory::Block DepthBuffer;
+			SceGxmDepthStencilSurface DepthSurface = {};
+		};
+		static FrameSurfaceSlot _frameSurfaceSlots[FrameSlotCount];
 
 		static bool _initialized;
 		static bool _vsync;
@@ -370,11 +441,38 @@ namespace nCine::RHI::GXM
 		// same surface goes on adding to this scene rather than starting one that would discard it (see
 		// EnsureScene())
 		static void* _sceneSurfaceData;
+		static std::uint32_t _sceneTargetId;
+		static const char* _sceneTargetLabel;
+		// The focused Vita capture distinguishes the composite, HUD, and final screen targets.
+		static bool _sceneTelemetryEnabled;
 		static std::uint32_t _sceneCounter;
 		static Telemetry _telemetry;
 		// The shader that most recently wrote the open scene, used to attribute its completion wait.
 		static const char* _sceneLastProgram;
 		static const char* _lastFinishedSceneProgram;
+		// The driver notification region supports independent words. Four slots cover the render graph's
+		// outstanding producers while keeping use well below the region sizes used by shipped GXM renderers.
+		static constexpr std::uint32_t NotificationSlotCount = 4;
+		struct PendingScene
+		{
+			SceGxmNotification Notification = {};
+			void* SurfaceData = nullptr;
+			const char* Program = nullptr;
+			char TargetLabel[32] = {};
+			std::uint32_t TargetId = 0;
+			std::int32_t Width = 0;
+			std::int32_t Height = 0;
+			bool Active = false;
+		};
+		static PendingScene _pendingScenes[NotificationSlotCount];
+		static std::uint32_t _nextNotificationSlot;
+		// Probe three additional notification words for eventual frame-fence ownership. The existing
+		// sceGxmFinish() remains in place, so this only validates notification delivery and never permits
+		// CPU writes to race the GPU.
+		static constexpr std::uint32_t FrameNotificationSlotCount = FrameSlotCount;
+		static SceGxmNotification _frameNotifications[FrameNotificationSlotCount];
+		static std::uint32_t _nextFrameNotificationSlot;
+		enum class WaitReason : std::uint8_t { Dependency, RingSlot, Present };
 		static const char* _telemetryNextDrawLabel;
 		// State that has to be re-applied after a scene begins (sceGxmBeginScene resets the pipeline state)
 		static bool _sceneStateApplied;
@@ -422,7 +520,7 @@ namespace nCine::RHI::GXM
 		static GxmMemory::Block _batchedCornerStream;
 
 		/** @brief Opens a scene on the current target if none is open, and (re)applies the pipeline state it reset */
-		static bool EnsureScene();
+		static bool EnsureScene(const GxmShaderProgram* program = nullptr);
 		/** @brief Programs the viewport and region clip of the current target from the tracked engine state */
 		static void ApplyViewportAndScissor();
 		/**
@@ -448,9 +546,20 @@ namespace nCine::RHI::GXM
 		/** @brief Returns the color surface, depth surface and dimensions the current target renders into */
 		static void GetCurrentTarget(SceGxmRenderTarget*& renderTarget, SceGxmColorSurface*& colorSurface,
 			SceGxmDepthStencilSurface*& depthSurface, SceGxmSyncObject*& syncObject, std::int32_t& width, std::int32_t& height);
-		// Written by the GPU when a scene's fragment phase completes, so the next scene can be held off until
-		// the surface it may sample is really there (see FinishScene())
-		static SceGxmNotification _sceneNotification;
+		/** @brief Waits for the pending producer if it wrote @p surfaceData, or unconditionally when it is `nullptr` */
+		static void WaitForPendingScene(void* surfaceData, WaitReason reason, const char* consumerProgram = nullptr, const char* consumerLabel = nullptr);
+		/** @brief Waits before a sampler reads a render-target texture produced by the pending scene */
+		static void WaitForPendingTexture(const GxmTexture* texture, const char* consumerProgram, const char* consumerLabel);
+		/** @brief Waits only for render-target textures sampled by the program about to draw */
+		static void WaitForProgramTextures(const GxmShaderProgram* program);
+		/** @brief Marks a completed producer slot reusable and attributes its completion wait */
+		static void CompletePendingScene(PendingScene& pendingScene, WaitReason reason, const char* consumerProgram = nullptr, const char* consumerLabel = nullptr);
+		/** @brief Releases one context and the ring memory it owns after all submitted work has completed */
+		static void ReleaseContextSlot(ContextSlot& slot);
+		/** @brief Releases the screen/depth resources owned by one frame slot */
+		static void ReleaseFrameSurfaceSlot(FrameSurfaceSlot& slot);
+		static bool CreateFrameSurfaceSlots(std::int32_t width, std::int32_t height);
+		static void DestroyScreenSurface();
 
 		/** @brief Blocks displaced by a grown buffer, freed once the frame that may still read them is done */
 		static constexpr std::uint32_t RetiredBlockCount = 8;

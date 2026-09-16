@@ -8,8 +8,10 @@
 
 #include "../../../../Main.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include <Containers/String.h>
 
@@ -22,6 +24,20 @@ namespace nCine::RHI::GXM
 {
 	namespace
 	{
+		bool RangeFits(std::size_t offset, std::size_t size, std::size_t capacity)
+		{
+			return offset <= capacity && size <= capacity - offset;
+		}
+
+		bool MultiplyFits(std::size_t a, std::size_t b, std::size_t& result)
+		{
+			if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a) {
+				return false;
+			}
+			result = a * b;
+			return true;
+		}
+
 		// Ring buffers the context streams its command lists and per-draw uniform data through. Everything but
 		// the vertex ring keeps the SDK default; that one is enlarged because every batched draw reserves the
 		// whole declared size of its instance array (~64 KB) out of it, and the ring must not wrap back onto
@@ -224,12 +240,12 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 	SceGxmContext* GxmDevice::_context = nullptr;
 	SceGxmShaderPatcher* GxmDevice::_shaderPatcher = nullptr;
 	SceGxmRenderTarget* GxmDevice::_displayRenderTarget = nullptr;
+	SceGxmRenderTarget* GxmDevice::_screenRenderTarget = nullptr;
+	std::int32_t GxmDevice::_screenWidth = GxmDevice::DisplayWidth;
+	std::int32_t GxmDevice::_screenHeight = GxmDevice::DisplayHeight;
 
-	GxmMemory::Block GxmDevice::_contextHostMem;
-	GxmMemory::Block GxmDevice::_vdmRingBuffer;
-	GxmMemory::Block GxmDevice::_vertexRingBuffer;
-	GxmMemory::Block GxmDevice::_fragmentRingBuffer;
-	GxmMemory::Block GxmDevice::_fragmentUsseRingBuffer;
+	GxmDevice::ContextSlot GxmDevice::_contextSlots[GxmDevice::FrameSlotCount];
+	std::uint32_t GxmDevice::_currentFrameSlot = 0;
 	GxmMemory::Block GxmDevice::_patcherBufferMem;
 	GxmMemory::Block GxmDevice::_patcherVertexUsseMem;
 	GxmMemory::Block GxmDevice::_patcherFragmentUsseMem;
@@ -240,18 +256,15 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 	std::uint32_t GxmDevice::_backBufferIndex = 0;
 	std::uint32_t GxmDevice::_frontBufferIndex = 0;
 
-	GxmMemory::Block GxmDevice::_screenBuffer;
-	SceGxmColorSurface GxmDevice::_screenSurface;
-	SceGxmTexture GxmDevice::_screenTexture;
-	SceGxmSyncObject* GxmDevice::_screenSyncObject = nullptr;
-
-	GxmMemory::Block GxmDevice::_depthBuffer;
-	SceGxmDepthStencilSurface GxmDevice::_depthSurface;
+	GxmDevice::FrameSurfaceSlot GxmDevice::_frameSurfaceSlots[GxmDevice::FrameSlotCount];
 
 	bool GxmDevice::_initialized = false;
 	bool GxmDevice::_vsync = true;
 	bool GxmDevice::_sceneOpen = false;
 	void* GxmDevice::_sceneSurfaceData = nullptr;
+	std::uint32_t GxmDevice::_sceneTargetId = 0;
+	const char* GxmDevice::_sceneTargetLabel = nullptr;
+	bool GxmDevice::_sceneTelemetryEnabled = false;
 	std::uint32_t GxmDevice::_sceneCounter = 0;
 	GxmDevice::Telemetry GxmDevice::_telemetry;
 	const char* GxmDevice::_sceneLastProgram = nullptr;
@@ -286,7 +299,10 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 	GxmMemory::Block GxmDevice::_quadCornerStream;
 	GxmMemory::Block GxmDevice::_batchedCornerStream;
 	GxmMemory::Block GxmDevice::_retiredBlocks[GxmDevice::RetiredBlockCount];
-	SceGxmNotification GxmDevice::_sceneNotification = {};
+	GxmDevice::PendingScene GxmDevice::_pendingScenes[GxmDevice::NotificationSlotCount];
+	std::uint32_t GxmDevice::_nextNotificationSlot = 0;
+	SceGxmNotification GxmDevice::_frameNotifications[GxmDevice::FrameNotificationSlotCount];
+	std::uint32_t GxmDevice::_nextFrameNotificationSlot = 0;
 
 	// -- Pipeline state --
 
@@ -514,6 +530,19 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		return telemetry;
 	}
 
+	std::uint32_t GxmDevice::GetCurrentFrameSlot()
+	{
+		return _currentFrameSlot;
+	}
+
+	std::uint32_t GxmDevice::GetFrameSlotBaseBytes()
+	{
+		const ContextSlot& slot = _contextSlots[0];
+		const FrameSurfaceSlot& surfaces = _frameSurfaceSlots[0];
+		return slot.HostMem.Size + slot.VdmRingBuffer.Size + slot.VertexRingBuffer.Size + slot.FragmentRingBuffer.Size
+			+ slot.FragmentUsseRingBuffer.Size + surfaces.ScreenBuffer.Size + surfaces.DepthBuffer.Size;
+	}
+
 	const void* GxmDevice::GetQuadCornerStream()
 	{
 		return _quadCornerStream.Base;
@@ -581,15 +610,16 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		// The screen surface is written by the frame and sampled by the present blit, so it is a
 		// render-to-texture hand-off like any other and carries its own sync object (see
 		// GxmRenderTarget::GetSceneTarget())
-		renderTarget = _displayRenderTarget;
-		colorSurface = &_screenSurface;
-		depthSurface = &_depthSurface;
-		syncObject = _screenSyncObject;
-		width = DisplayWidth;
-		height = DisplayHeight;
+		FrameSurfaceSlot& slot = _frameSurfaceSlots[_currentFrameSlot];
+		colorSurface = &slot.ScreenSurface;
+		depthSurface = &slot.DepthSurface;
+		syncObject = slot.ScreenSyncObject;
+		renderTarget = (_screenRenderTarget != nullptr ? _screenRenderTarget : _displayRenderTarget);
+		width = _screenWidth;
+		height = _screenHeight;
 	}
 
-	bool GxmDevice::EnsureScene()
+	bool GxmDevice::EnsureScene(const GxmShaderProgram* program)
 	{
 		if (_context == nullptr) {
 			return false;
@@ -613,14 +643,20 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		void* surfaceData = sceGxmColorSurfaceGetData(colorSurface);
 		if (_sceneOpen) {
 			if (surfaceData == _sceneSurfaceData) {
+				WaitForProgramTextures(program);
 				if (!_sceneStateApplied) {
 					ApplyViewportAndScissor();
 					_sceneStateApplied = true;
 				}
 				return true;
 			}
+			_telemetry.TargetSwitches++;
 			FinishScene();
 		}
+
+		// FinishScene() above publishes the old target. Only the new program's sampler slots are dependencies;
+		// waiting every retained texture binding unnecessarily stalls on targets this draw does not read.
+		WaitForProgramTextures(program);
 
 		const std::int32_t result = sceGxmBeginScene(_context, 0, renderTarget, nullptr, nullptr, syncObject,
 			colorSurface, depthSurface);
@@ -632,6 +668,12 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		_sceneOpen = true;
 		_telemetry.SceneBegins++;
 		_sceneSurfaceData = surfaceData;
+		_sceneTargetId = (_currentRenderTarget != nullptr && _currentRenderTarget->GetColorTexture(0) != nullptr
+			? _currentRenderTarget->GetColorTexture(0)->GetUniqueId() : 0);
+		const char* targetLabel = (_currentRenderTarget != nullptr ? _currentRenderTarget->GetObjectLabel() : "Screen");
+		_sceneTargetLabel = (targetLabel != nullptr ? targetLabel : "RenderTarget");
+		_sceneTelemetryEnabled = (std::strcmp(_sceneTargetLabel, "Composite") == 0 ||
+			std::strcmp(_sceneTargetLabel, "UI") == 0 || std::strcmp(_sceneTargetLabel, "Screen") == 0);
 		_sceneLastProgram = nullptr;
 		_sceneWidth = width;
 		_sceneHeight = height;
@@ -640,43 +682,216 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		return true;
 	}
 
-	void GxmDevice::FinishScene()
+	void GxmDevice::ReleaseContextSlot(ContextSlot& slot)
 	{
-		if (!_sceneOpen || _context == nullptr) {
-			return;
+		if (slot.Context != nullptr) {
+			sceGxmDestroyContext(slot.Context);
+			slot.Context = nullptr;
 		}
-		// A scene's output is sampled by a later scene in the same frame all along the pipeline's chain (the
-		// blur passes read the scene view, the composite reads all of them), and sharing one context is not
-		// enough to make that hand-over safe: this scene's tile writeback is still in flight while the next one
-		// records, so the reader can sample what the surface held before. Measured on the console - waiting
-		// here is what makes the level view arrive intact, and not waiting leaves it holding just its clear.
-		//
-		// The notification is sceGxm's own answer to that: the GPU writes `value` to `address` when this
-		// scene's fragment phase completes, so the wait is for this one scene rather than for the whole
-		// pipeline the way sceGxmFinish() would be. A tighter version would wait only when the next scene
-		// really samples this surface, which needs a scene's bindings to be known before it begins.
-		_sceneNotification.value++;
-		sceGxmEndScene(_context, nullptr, &_sceneNotification);
-		_telemetry.SceneFinishes++;
+		GxmMemory::Free(slot.FragmentUsseRingBuffer);
+		GxmMemory::Free(slot.FragmentRingBuffer);
+		GxmMemory::Free(slot.VertexRingBuffer);
+		GxmMemory::Free(slot.VdmRingBuffer);
+		GxmMemory::Free(slot.HostMem);
+	}
+
+	void GxmDevice::ReleaseFrameSurfaceSlot(FrameSurfaceSlot& slot)
+	{
+		if (slot.ScreenSyncObject != nullptr) {
+			sceGxmSyncObjectDestroy(slot.ScreenSyncObject);
+			slot.ScreenSyncObject = nullptr;
+		}
+		GxmMemory::Free(slot.ScreenBuffer);
+		GxmMemory::Free(slot.DepthBuffer);
+	}
+
+	bool GxmDevice::CreateFrameSurfaceSlots(std::int32_t width, std::int32_t height)
+	{
+		const std::int32_t stride = (width + 7) & ~7;
+		const std::uint32_t screenBufferSize = std::uint32_t(stride) * std::uint32_t(height) * 4u;
+		const std::uint32_t depthBufferSize = std::uint32_t(DisplayStride) * std::uint32_t(DisplayHeight) * 4u;
+		const char* const screenNames[FrameSlotCount] = { "Jazz2:ScreenSurface0", "Jazz2:ScreenSurface1", "Jazz2:ScreenSurface2" };
+		const char* const depthNames[FrameSlotCount] = { "Jazz2:DepthSurface0", "Jazz2:DepthSurface1", "Jazz2:DepthSurface2" };
+		for (std::uint32_t i = 0; i < FrameSlotCount; i++) {
+			FrameSurfaceSlot& slot = _frameSurfaceSlots[i];
+			slot.ScreenBuffer = GxmMemory::AllocCdram(screenNames[i], screenBufferSize, SCE_GXM_MEMORY_ATTRIB_RW);
+			slot.DepthBuffer = GxmMemory::Alloc(depthNames[i], depthBufferSize, SCE_GXM_MEMORY_ATTRIB_RW);
+			if (!slot.ScreenBuffer.IsValid() || !slot.DepthBuffer.IsValid()) {
+				LOGE("Failed to allocate screen/depth surfaces for frame slot {}", i);
+				return false;
+			}
+			std::memset(slot.ScreenBuffer.Base, 0, screenBufferSize);
+			if (sceGxmColorSurfaceInit(&slot.ScreenSurface, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
+				SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
+				width, height, stride, slot.ScreenBuffer.Base) < 0 ||
+				sceGxmSyncObjectCreate(&slot.ScreenSyncObject) < 0 ||
+				sceGxmTextureInitLinear(&slot.ScreenTexture, slot.ScreenBuffer.Base, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, width, height, 0) < 0 ||
+				sceGxmDepthStencilSurfaceInit(&slot.DepthSurface, SCE_GXM_DEPTH_STENCIL_FORMAT_DF32,
+					SCE_GXM_DEPTH_STENCIL_SURFACE_TILED, DisplayStride, slot.DepthBuffer.Base, nullptr) < 0) {
+				LOGE("Failed to initialize screen/depth surfaces for frame slot {}", i);
+				return false;
+			}
+			const SceGxmTextureFilter filter = (DisplayWidth % width == 0 && DisplayHeight % height == 0
+				? SCE_GXM_TEXTURE_FILTER_POINT : SCE_GXM_TEXTURE_FILTER_LINEAR);
+			sceGxmTextureSetMinFilter(&slot.ScreenTexture, filter);
+			sceGxmTextureSetMagFilter(&slot.ScreenTexture, filter);
+			sceGxmTextureSetUAddrMode(&slot.ScreenTexture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+			sceGxmTextureSetVAddrMode(&slot.ScreenTexture, SCE_GXM_TEXTURE_ADDR_CLAMP);
+			sceGxmDepthStencilSurfaceSetBackgroundDepth(&slot.DepthSurface, 1.0f);
+		}
+		return true;
+	}
+
+	void GxmDevice::DestroyScreenSurface()
+	{
+		for (FrameSurfaceSlot& slot : _frameSurfaceSlots) {
+			ReleaseFrameSurfaceSlot(slot);
+		}
+		if (_screenRenderTarget != nullptr) {
+			sceGxmDestroyRenderTarget(_screenRenderTarget);
+			_screenRenderTarget = nullptr;
+		}
+	}
+
+	void GxmDevice::CompletePendingScene(PendingScene& pendingScene, WaitReason reason, const char* consumerProgram, const char* consumerLabel)
+	{
 		const std::uint64_t waitStart = sceKernelGetProcessTimeWide();
-		sceGxmNotificationWait(&_sceneNotification);
+		sceGxmNotificationWait(&pendingScene.Notification);
 		_telemetry.NotificationWaits++;
 		const std::uint64_t waitMicroseconds = sceKernelGetProcessTimeWide() - waitStart;
 		_telemetry.NotificationWaitMicroseconds += waitMicroseconds;
-		if (_sceneLastProgram != nullptr) {
-			_lastFinishedSceneProgram = _sceneLastProgram;
+		switch (reason) {
+			case WaitReason::Dependency:
+				_telemetry.DependencyWaits++;
+				_telemetry.DependencyWaitMicroseconds += waitMicroseconds;
+				break;
+			case WaitReason::RingSlot:
+				_telemetry.RingSlotWaits++;
+				_telemetry.RingSlotWaitMicroseconds += waitMicroseconds;
+				break;
+			case WaitReason::Present:
+				_telemetry.PresentDependencyWaits++;
+				_telemetry.PresentDependencyWaitMicroseconds += waitMicroseconds;
+				break;
+		}
+		if (reason != WaitReason::RingSlot && consumerProgram != nullptr &&
+			std::strcmp(pendingScene.TargetLabel, "Composite") == 0) {
+			const char* producerProgram = (pendingScene.Program != nullptr ? pendingScene.Program : "<no draw>");
+			const char* passLabel = (consumerLabel != nullptr ? consumerLabel : consumerProgram);
+			for (Telemetry::DependencyWait& dependency : _telemetry.DependencyWaitsByPass) {
+				if (dependency.ProducerProgram == nullptr) {
+					dependency.ProducerProgram = producerProgram;
+					std::strncpy(dependency.ProducerTargetLabel, pendingScene.TargetLabel, sizeof(dependency.ProducerTargetLabel) - 1);
+					dependency.ConsumerProgram = consumerProgram;
+					dependency.ConsumerLabel = passLabel;
+					dependency.ProducerTargetId = pendingScene.TargetId;
+					dependency.ProducerWidth = pendingScene.Width;
+					dependency.ProducerHeight = pendingScene.Height;
+					dependency.Count = 1;
+					dependency.WaitMicroseconds = waitMicroseconds;
+					break;
+				}
+				if (dependency.ProducerTargetId == pendingScene.TargetId && dependency.ProducerWidth == pendingScene.Width &&
+					dependency.ProducerHeight == pendingScene.Height && std::strcmp(dependency.ProducerProgram, producerProgram) == 0 &&
+					std::strcmp(dependency.ConsumerProgram, consumerProgram) == 0 && std::strcmp(dependency.ConsumerLabel, passLabel) == 0) {
+					dependency.Count++;
+					dependency.WaitMicroseconds += waitMicroseconds;
+					break;
+				}
+			}
+		}
+		_lastFinishedSceneProgram = pendingScene.Program;
+		if (pendingScene.Program != nullptr) {
 			for (Telemetry::ShaderDraw& draw : _telemetry.ShaderDraws) {
-				if (draw.ProgramName != nullptr && std::strcmp(draw.ProgramName, _sceneLastProgram) == 0) {
+				if (draw.ProgramName != nullptr && std::strcmp(draw.ProgramName, pendingScene.Program) == 0) {
 					draw.SceneEnds++;
 					draw.WaitMicroseconds += waitMicroseconds;
 					break;
 				}
 			}
 		}
+		pendingScene.Active = false;
+		pendingScene.SurfaceData = nullptr;
+		pendingScene.Program = nullptr;
+		pendingScene.TargetLabel[0] = '\0';
+		pendingScene.TargetId = 0;
+		pendingScene.Width = 0;
+		pendingScene.Height = 0;
+	}
+
+	void GxmDevice::WaitForPendingScene(void* surfaceData, WaitReason reason, const char* consumerProgram, const char* consumerLabel)
+	{
+		for (PendingScene& pendingScene : _pendingScenes) {
+			if (pendingScene.Active && (surfaceData == nullptr || surfaceData == pendingScene.SurfaceData)) {
+				CompletePendingScene(pendingScene, reason, consumerProgram, consumerLabel);
+			}
+		}
+	}
+
+	void GxmDevice::WaitForPendingTexture(const GxmTexture* texture, const char* consumerProgram, const char* consumerLabel)
+	{
+		if (texture != nullptr && texture->IsRenderTarget()) {
+			WaitForPendingScene(texture->GetSurfaceData(), WaitReason::Dependency, consumerProgram, consumerLabel);
+		}
+	}
+
+	void GxmDevice::WaitForProgramTextures(const GxmShaderProgram* program)
+	{
+		if (program == nullptr) {
+			return;
+		}
+		const char* consumerProgram = program->GetProgramName();
+		const char* consumerLabel = (_telemetryNextDrawLabel != nullptr ? _telemetryNextDrawLabel : consumerProgram);
+		for (const GxmShaderProgram::GxmSamplerSlot& slot : program->GetVertexSamplerSlots()) {
+			WaitForPendingTexture(GetBoundTexture(slot.EngineUnit), consumerProgram, consumerLabel);
+		}
+		for (const GxmShaderProgram::GxmSamplerSlot& slot : program->GetFragmentSamplerSlots()) {
+			WaitForPendingTexture(GetBoundTexture(slot.EngineUnit), consumerProgram, consumerLabel);
+		}
+	}
+
+	void GxmDevice::FinishScene()
+	{
+		if (!_sceneOpen || _context == nullptr) {
+			return;
+		}
+		PendingScene& pendingScene = _pendingScenes[_nextNotificationSlot];
+		if (pendingScene.Active) {
+			CompletePendingScene(pendingScene, WaitReason::RingSlot);
+		}
+		if (pendingScene.Notification.value == 0xffffffffu) {
+			WaitForPendingScene(nullptr, WaitReason::RingSlot);
+			for (PendingScene& slot : _pendingScenes) {
+				slot.Notification.value = 0;
+				*slot.Notification.address = 0;
+			}
+		}
+		pendingScene.Notification.value++;
+		sceGxmEndScene(_context, nullptr, &pendingScene.Notification);
+		_telemetry.SceneFinishes++;
+		pendingScene.SurfaceData = _sceneSurfaceData;
+		pendingScene.Program = _sceneLastProgram;
+		std::strncpy(pendingScene.TargetLabel, _sceneTargetLabel, sizeof(pendingScene.TargetLabel) - 1);
+		pendingScene.TargetId = _sceneTargetId;
+		pendingScene.Width = _sceneWidth;
+		pendingScene.Height = _sceneHeight;
+		pendingScene.Active = true;
+		_nextNotificationSlot = (_nextNotificationSlot + 1) % NotificationSlotCount;
 		_sceneOpen = false;
 		_sceneSurfaceData = nullptr;
+		_sceneTargetId = 0;
+		_sceneTargetLabel = nullptr;
+		_sceneTelemetryEnabled = false;
 		_sceneLastProgram = nullptr;
 		_sceneStateApplied = false;
+	}
+
+	void GxmDevice::WaitForGpuIdle()
+	{
+		FinishScene();
+		if (_context != nullptr) {
+			WaitForPendingScene(nullptr, WaitReason::Dependency);
+		}
 	}
 
 	void GxmDevice::ApplyViewportAndScissor()
@@ -875,7 +1090,7 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 	void GxmDevice::DrawCommon(PrimitiveType primitive, std::int32_t firstVertex, std::uint32_t count,
 		bool indexed, IndexFormat indexFormat, std::uintptr_t indexOffset, std::int32_t numInstances, std::int32_t baseVertex)
 	{
-		if (count == 0 || _currentProgram == nullptr || !EnsureScene()) {
+		if (count == 0 || _currentProgram == nullptr) {
 			return;
 		}
 
@@ -901,6 +1116,10 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 			_blending.SrcRgb, _blending.DstRgb, _blending.SrcAlpha, _blending.DstAlpha);
 		SceGxmFragmentProgram* fragmentProgram = program->GetFragmentProgram(blendKey, blendInfoPtr);
 		if (fragmentProgram == nullptr) {
+			return;
+		}
+
+		if (!EnsureScene(program)) {
 			return;
 		}
 
@@ -994,17 +1213,26 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		// stream can absorb it - the static corner streams are indexed from zero by definition, and the draws
 		// that read them always pass a first vertex of zero anyway.
 		const bool foldFirstVertexIntoStream = (!indexed && !program->UsesStaticCornerStream() && firstVertex > 0);
+		const GxmBufferObject* geometryVbo = nullptr;
+		std::size_t vertexStreamOffset = 0;
+		const std::uint32_t geometryStride = program->GetGeometryStride();
 		if (program->UsesGeometryStream()) {
 			const GxmBufferObject* vbo = program->GetBoundVbo();
 			const void* vertexData = (vbo != nullptr ? vbo->GetGpuData() : nullptr);
-			if (vertexData == nullptr) {
+			if (vertexData == nullptr || geometryStride == 0) {
 				return;
 			}
 			// sceGxmDraw has no base-vertex parameter, so a base vertex shifts the stream address instead
-			const std::uint32_t stride = program->GetGeometryStride();
-			const std::uint8_t* base = static_cast<const std::uint8_t*>(vertexData) + program->GetVboOffset()
-				+ std::size_t(baseVertex > 0 ? baseVertex : 0) * stride
-				+ std::size_t(foldFirstVertexIntoStream ? firstVertex : 0) * stride;
+			std::size_t baseVertexBytes, firstVertexBytes;
+			if (!MultiplyFits(std::size_t(baseVertex > 0 ? baseVertex : 0), geometryStride, baseVertexBytes) ||
+				!MultiplyFits(std::size_t(foldFirstVertexIntoStream ? firstVertex : 0), geometryStride, firstVertexBytes) ||
+				program->GetVboOffset() > vbo->GetSize() || baseVertexBytes > vbo->GetSize() - program->GetVboOffset() ||
+				firstVertexBytes > vbo->GetSize() - program->GetVboOffset() - baseVertexBytes) {
+				return;
+			}
+			vertexStreamOffset = std::size_t(program->GetVboOffset()) + baseVertexBytes + firstVertexBytes;
+			geometryVbo = vbo;
+			const std::uint8_t* base = static_cast<const std::uint8_t*>(vertexData) + vertexStreamOffset;
 			sceGxmSetVertexStream(_context, 0, base);
 		}
 
@@ -1016,11 +1244,29 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		if (indexed) {
 			const GxmBufferObject* ibo = program->GetBoundIbo();
 			const void* indexBase = (ibo != nullptr ? ibo->GetGpuData() : nullptr);
-			if (indexBase == nullptr) {
+			const std::size_t indexSize = (indexFormat == IndexFormat::UInt32 ? sizeof(std::uint32_t) : sizeof(std::uint16_t));
+			std::size_t indexBytes;
+			if (indexBase == nullptr || !MultiplyFits(count, indexSize, indexBytes) || indexOffset > ibo->GetSize() ||
+				!RangeFits(std::size_t(indexOffset), indexBytes, ibo->GetSize())) {
 				return;
 			}
 			indexData = static_cast<const std::uint8_t*>(indexBase) + indexOffset;
 			gxmIndexFormat = (indexFormat == IndexFormat::UInt32 ? SCE_GXM_INDEX_FORMAT_U32 : SCE_GXM_INDEX_FORMAT_U16);
+			if (geometryVbo != nullptr) {
+				std::uint32_t maxIndex = 0;
+				if (indexFormat == IndexFormat::UInt32) {
+					const auto* indices = static_cast<const std::uint32_t*>(indexData);
+					for (std::uint32_t i = 0; i < count; i++) maxIndex = std::max(maxIndex, indices[i]);
+				} else {
+					const auto* indices = static_cast<const std::uint16_t*>(indexData);
+					for (std::uint32_t i = 0; i < count; i++) maxIndex = std::max(maxIndex, std::uint32_t(indices[i]));
+				}
+				std::size_t vertexBytes;
+				if (!MultiplyFits(std::size_t(maxIndex) + 1, geometryStride, vertexBytes) ||
+					!RangeFits(vertexStreamOffset, vertexBytes, geometryVbo->GetSize())) {
+					return;
+				}
+			}
 		} else if (isLineStrip) {
 			// A strip of N vertices is N-1 segments, which the paired index buffer spells out - from the pair
 			// that starts at the first vertex, or from the very first pair when the stream has already been
@@ -1042,6 +1288,12 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 			}
 			indexData = static_cast<const std::uint16_t*>(_sequentialIndices.Base) + first;
 		}
+		if (!indexed && geometryVbo != nullptr) {
+			std::size_t vertexBytes;
+			if (!MultiplyFits(count, geometryStride, vertexBytes) || !RangeFits(vertexStreamOffset, vertexBytes, geometryVbo->GetSize())) {
+				return;
+			}
+		}
 
 		if (numInstances > 1) {
 			// GPU instancing would need both an index buffer whose pattern repeats per instance and a vertex
@@ -1060,17 +1312,22 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		_telemetryNextDrawLabel = nullptr;
 		if (programName != nullptr) {
 			_sceneLastProgram = programName;
-			for (Telemetry::ShaderDraw& draw : _telemetry.ShaderDraws) {
-				if (draw.ProgramName == nullptr) {
-					draw.ProgramName = programName;
-					draw.Calls = 1;
-					draw.Indices = indexCount;
-					break;
-				}
-				if (std::strcmp(draw.ProgramName, programName) == 0) {
-					draw.Calls++;
-					draw.Indices += indexCount;
-					break;
+			if (_sceneTelemetryEnabled) {
+				for (Telemetry::TargetShaderDraw& draw : _telemetry.TargetShaderDraws) {
+					if (draw.ProgramName == nullptr) {
+						draw.ProgramName = programName;
+						draw.TargetId = _sceneTargetId;
+						std::strncpy(draw.TargetLabel, _sceneTargetLabel, sizeof(draw.TargetLabel) - 1);
+						draw.Calls = 1;
+						draw.Indices = indexCount;
+						break;
+					}
+					if (draw.TargetId == _sceneTargetId && std::strcmp(draw.ProgramName, programName) == 0 &&
+						std::strcmp(draw.TargetLabel, _sceneTargetLabel) == 0) {
+						draw.Calls++;
+						draw.Indices += indexCount;
+						break;
+					}
 				}
 			}
 		}
@@ -1324,37 +1581,49 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		// with no clue why, instead of the diagnostic that got us here
 		_initialized = true;
 
-		// The context's ring buffers, then the context itself
-		_contextHostMem = GxmMemory::Alloc("Jazz2:GxmContextHost", ContextHostMemSize, SCE_GXM_MEMORY_ATTRIB_RW);
-		_vdmRingBuffer = GxmMemory::Alloc("Jazz2:GxmVdmRing", VdmRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
-		_vertexRingBuffer = GxmMemory::Alloc("Jazz2:GxmVertexRing", VertexRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
-		_fragmentRingBuffer = GxmMemory::Alloc("Jazz2:GxmFragmentRing", FragmentRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
-		_fragmentUsseRingBuffer = GxmMemory::AllocFragmentUsse("Jazz2:GxmFragmentUsseRing", FragmentUsseRingBufferSize);
-		if (!_contextHostMem.IsValid() || !_vdmRingBuffer.IsValid() || !_vertexRingBuffer.IsValid() ||
-			!_fragmentRingBuffer.IsValid() || !_fragmentUsseRingBuffer.IsValid()) {
-			LOGE("Failed to allocate the sceGxm context ring buffers");
-			DestroySwapchain();
-			return false;
-		}
+		// Each frame slot receives independent command and default-uniform rings. The present barrier remains
+		// active in this stage, so only these rings rotate; screen and viewport surfaces stay shared until their
+		// per-slot copies are introduced together with notification-only reuse.
+		const char* const hostNames[FrameSlotCount] = { "Jazz2:GxmContextHost0", "Jazz2:GxmContextHost1", "Jazz2:GxmContextHost2" };
+		const char* const vdmNames[FrameSlotCount] = { "Jazz2:GxmVdmRing0", "Jazz2:GxmVdmRing1", "Jazz2:GxmVdmRing2" };
+		const char* const vertexNames[FrameSlotCount] = { "Jazz2:GxmVertexRing0", "Jazz2:GxmVertexRing1", "Jazz2:GxmVertexRing2" };
+		const char* const fragmentNames[FrameSlotCount] = { "Jazz2:GxmFragmentRing0", "Jazz2:GxmFragmentRing1", "Jazz2:GxmFragmentRing2" };
+		const char* const fragmentUsseNames[FrameSlotCount] = { "Jazz2:GxmFragmentUsseRing0", "Jazz2:GxmFragmentUsseRing1", "Jazz2:GxmFragmentUsseRing2" };
+		for (std::uint32_t i = 0; i < FrameSlotCount; i++) {
+			ContextSlot& slot = _contextSlots[i];
+			slot.HostMem = GxmMemory::Alloc(hostNames[i], ContextHostMemSize, SCE_GXM_MEMORY_ATTRIB_RW);
+			slot.VdmRingBuffer = GxmMemory::Alloc(vdmNames[i], VdmRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
+			slot.VertexRingBuffer = GxmMemory::Alloc(vertexNames[i], VertexRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
+			slot.FragmentRingBuffer = GxmMemory::Alloc(fragmentNames[i], FragmentRingBufferSize, SCE_GXM_MEMORY_ATTRIB_READ);
+			slot.FragmentUsseRingBuffer = GxmMemory::AllocFragmentUsse(fragmentUsseNames[i], FragmentUsseRingBufferSize);
+			if (!slot.HostMem.IsValid() || !slot.VdmRingBuffer.IsValid() || !slot.VertexRingBuffer.IsValid() ||
+				!slot.FragmentRingBuffer.IsValid() || !slot.FragmentUsseRingBuffer.IsValid()) {
+				LOGE("Failed to allocate sceGxm context rings for frame slot {}", i);
+				DestroySwapchain();
+				return false;
+			}
 
-		SceGxmContextParams contextParams = {};
-		contextParams.hostMem = _contextHostMem.Base;
-		contextParams.hostMemSize = _contextHostMem.Size;
-		contextParams.vdmRingBufferMem = _vdmRingBuffer.Base;
-		contextParams.vdmRingBufferMemSize = _vdmRingBuffer.Size;
-		contextParams.vertexRingBufferMem = _vertexRingBuffer.Base;
-		contextParams.vertexRingBufferMemSize = _vertexRingBuffer.Size;
-		contextParams.fragmentRingBufferMem = _fragmentRingBuffer.Base;
-		contextParams.fragmentRingBufferMemSize = _fragmentRingBuffer.Size;
-		contextParams.fragmentUsseRingBufferMem = _fragmentUsseRingBuffer.Base;
-		contextParams.fragmentUsseRingBufferMemSize = _fragmentUsseRingBuffer.Size;
-		contextParams.fragmentUsseRingBufferOffset = _fragmentUsseRingBuffer.UsseOffset;
-		result = sceGxmCreateContext(&contextParams, &_context);
-		if (result < 0) {
-			LOGE("sceGxmCreateContext() failed with 0x{:.8x}", std::uint32_t(result));
-			DestroySwapchain();
-			return false;
+			SceGxmContextParams contextParams = {};
+			contextParams.hostMem = slot.HostMem.Base;
+			contextParams.hostMemSize = slot.HostMem.Size;
+			contextParams.vdmRingBufferMem = slot.VdmRingBuffer.Base;
+			contextParams.vdmRingBufferMemSize = slot.VdmRingBuffer.Size;
+			contextParams.vertexRingBufferMem = slot.VertexRingBuffer.Base;
+			contextParams.vertexRingBufferMemSize = slot.VertexRingBuffer.Size;
+			contextParams.fragmentRingBufferMem = slot.FragmentRingBuffer.Base;
+			contextParams.fragmentRingBufferMemSize = slot.FragmentRingBuffer.Size;
+			contextParams.fragmentUsseRingBufferMem = slot.FragmentUsseRingBuffer.Base;
+			contextParams.fragmentUsseRingBufferMemSize = slot.FragmentUsseRingBuffer.Size;
+			contextParams.fragmentUsseRingBufferOffset = slot.FragmentUsseRingBuffer.UsseOffset;
+			result = sceGxmCreateContext(&contextParams, &slot.Context);
+			if (result < 0) {
+				LOGE("sceGxmCreateContext(frame slot {}) failed with 0x{:.8x}", i, std::uint32_t(result));
+				DestroySwapchain();
+				return false;
+			}
 		}
+		_currentFrameSlot = 0;
+		_context = _contextSlots[_currentFrameSlot].Context;
 
 		// The render target describing the panel's tiling, shared by the screen surface and the display buffers
 		SceGxmRenderTargetParams renderTargetParams = {};
@@ -1371,6 +1640,8 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 			DestroySwapchain();
 			return false;
 		}
+		_screenWidth = DisplayWidth;
+		_screenHeight = DisplayHeight;
 
 		// The display buffers the controller scans out of, with the sync object that keeps the GPU from
 		// overwriting one still on screen
@@ -1400,61 +1671,12 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 			}
 		}
 
-		// The intermediate surface every screen-targeted draw lands in, kept bottom-up like OpenGL and
-		// flipped into a display buffer at present time
-		_screenBuffer = GxmMemory::AllocCdram("Jazz2:ScreenSurface", displayBufferSize, SCE_GXM_MEMORY_ATTRIB_RW);
-		if (!_screenBuffer.IsValid()) {
-			LOGE("Failed to allocate the intermediate screen surface");
+		// Each context slot owns its intermediate screen and depth storage. The renderer clears both before use,
+		// so their contents never need to survive a switch to another frame slot.
+		if (!CreateFrameSurfaceSlots(_screenWidth, _screenHeight)) {
 			DestroySwapchain();
 			return false;
 		}
-		std::memset(_screenBuffer.Base, 0, displayBufferSize);
-		result = sceGxmColorSurfaceInit(&_screenSurface, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
-			SCE_GXM_COLOR_SURFACE_LINEAR, SCE_GXM_COLOR_SURFACE_SCALE_NONE, SCE_GXM_OUTPUT_REGISTER_SIZE_32BIT,
-			DisplayWidth, DisplayHeight, DisplayStride, _screenBuffer.Base);
-		if (result < 0) {
-			LOGE("sceGxmColorSurfaceInit(screen) failed with 0x{:.8x}", std::uint32_t(result));
-			DestroySwapchain();
-			return false;
-		}
-		result = sceGxmSyncObjectCreate(&_screenSyncObject);
-		if (result < 0) {
-			LOGE("sceGxmSyncObjectCreate(screen) failed with 0x{:.8x}", std::uint32_t(result));
-			_screenSyncObject = nullptr;
-			DestroySwapchain();
-			return false;
-		}
-		result = sceGxmTextureInitLinear(&_screenTexture, _screenBuffer.Base, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR,
-			DisplayWidth, DisplayHeight, 0);
-		if (result < 0) {
-			LOGE("sceGxmTextureInitLinear(screen) failed with 0x{:.8x}", std::uint32_t(result));
-			DestroySwapchain();
-			return false;
-		}
-		sceGxmTextureSetMinFilter(&_screenTexture, SCE_GXM_TEXTURE_FILTER_POINT);
-		sceGxmTextureSetMagFilter(&_screenTexture, SCE_GXM_TEXTURE_FILTER_POINT);
-		sceGxmTextureSetUAddrMode(&_screenTexture, SCE_GXM_TEXTURE_ADDR_CLAMP);
-		sceGxmTextureSetVAddrMode(&_screenTexture, SCE_GXM_TEXTURE_ADDR_CLAMP);
-
-		// One depth/stencil surface shared by every scene: the renderer is 2D and never needs a depth buffer's
-		// contents to outlive a pass, and this stride covers any render target the pipeline creates
-		const std::uint32_t depthBufferSize = std::uint32_t(DisplayStride) * std::uint32_t(DisplayHeight) * 4u;
-		_depthBuffer = GxmMemory::Alloc("Jazz2:DepthSurface", depthBufferSize, SCE_GXM_MEMORY_ATTRIB_RW);
-		if (!_depthBuffer.IsValid()) {
-			LOGE("Failed to allocate the depth/stencil surface");
-			DestroySwapchain();
-			return false;
-		}
-		result = sceGxmDepthStencilSurfaceInit(&_depthSurface, SCE_GXM_DEPTH_STENCIL_FORMAT_DF32,
-			SCE_GXM_DEPTH_STENCIL_SURFACE_TILED, DisplayStride, _depthBuffer.Base, nullptr);
-		if (result < 0) {
-			LOGE("sceGxmDepthStencilSurfaceInit() failed with 0x{:.8x}", std::uint32_t(result));
-			DestroySwapchain();
-			return false;
-		}
-		// Every scene initializes its on-chip tile depth from this value, so setting it to the far plane is
-		// what gives each pass the cleared depth buffer an OpenGL frame starts with
-		sceGxmDepthStencilSurfaceSetBackgroundDepth(&_depthSurface, 1.0f);
 
 		// The shader patcher every program's vertex/fragment programs are created through
 		_patcherBufferMem = GxmMemory::Alloc("Jazz2:PatcherBuffer", PatcherBufferSize, SCE_GXM_MEMORY_ATTRIB_RW);
@@ -1521,14 +1743,24 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 
 		// A scene's completion notification has to be written into the driver's own notification region
 		// (see FinishScene())
-		_sceneNotification.address = sceGxmGetNotificationRegion();
-		_sceneNotification.value = 0;
-		if (_sceneNotification.address == nullptr) {
+		volatile std::uint32_t* notificationRegion = sceGxmGetNotificationRegion();
+		if (notificationRegion == nullptr) {
 			LOGE("sceGxmGetNotificationRegion() returned nothing, so scene completion cannot be waited on");
 			DestroySwapchain();
 			return false;
 		}
-		*_sceneNotification.address = 0;
+		for (std::uint32_t i = 0; i < NotificationSlotCount; i++) {
+			_pendingScenes[i] = {};
+			_pendingScenes[i].Notification.address = notificationRegion + i;
+			*_pendingScenes[i].Notification.address = 0;
+		}
+		_nextNotificationSlot = 0;
+		for (std::uint32_t i = 0; i < FrameNotificationSlotCount; i++) {
+			_frameNotifications[i] = {};
+			_frameNotifications[i].address = notificationRegion + NotificationSlotCount + i;
+			*_frameNotifications[i].address = 0;
+		}
+		_nextFrameNotificationSlot = 0;
 
 		// Before the first compile of anything, so a built-in shader that fails says why
 		GxmShaderProgram::InstallCompilerLogCallback();
@@ -1565,8 +1797,8 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 
 		_backBufferIndex = 0;
 		_frontBufferIndex = DisplayBufferCount - 1;
-		LOGI("sceGxm initialized ({}x{}, {} display buffers, {} KB of GPU memory reserved)",
-			DisplayWidth, DisplayHeight, DisplayBufferCount, GxmMemory::GetAllocatedBytes() / 1024);
+		LOGI("sceGxm initialized ({}x{} rendered, {}x{} displayed, {} display buffers, {} KB of GPU memory reserved)",
+			_screenWidth, _screenHeight, DisplayWidth, DisplayHeight, DisplayBufferCount, GxmMemory::GetAllocatedBytes() / 1024);
 		return true;
 	}
 
@@ -1616,22 +1848,14 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 			}
 			GxmMemory::Free(_displayBuffers[i]);
 		}
-		if (_screenSyncObject != nullptr) {
-			sceGxmSyncObjectDestroy(_screenSyncObject);
-			_screenSyncObject = nullptr;
-		}
+		DestroyScreenSurface();
 
 		if (_displayRenderTarget != nullptr) {
 			sceGxmDestroyRenderTarget(_displayRenderTarget);
 			_displayRenderTarget = nullptr;
 		}
-		if (_context != nullptr) {
-			sceGxmDestroyContext(_context);
-			_context = nullptr;
-		}
+		_context = nullptr;
 
-		GxmMemory::Free(_screenBuffer);
-		GxmMemory::Free(_depthBuffer);
 		GxmMemory::Free(_clearVertices);
 		GxmMemory::Free(_presentVertices);
 		GxmMemory::Free(_quadCornerStream);
@@ -1641,11 +1865,10 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		GxmMemory::Free(_patcherBufferMem);
 		GxmMemory::Free(_patcherVertexUsseMem);
 		GxmMemory::Free(_patcherFragmentUsseMem);
-		GxmMemory::Free(_fragmentUsseRingBuffer);
-		GxmMemory::Free(_fragmentRingBuffer);
-		GxmMemory::Free(_vertexRingBuffer);
-		GxmMemory::Free(_vdmRingBuffer);
-		GxmMemory::Free(_contextHostMem);
+		for (ContextSlot& slot : _contextSlots) {
+			ReleaseContextSlot(slot);
+		}
+		_currentFrameSlot = 0;
 		GxmMemory::ReleaseRetainedSurfaces();
 		_sequentialIndexCount = 0;
 		_lineStripVertexCount = 0;
@@ -1660,6 +1883,49 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		static_cast<void>(height);
 	}
 
+	bool GxmDevice::ResizeScreenSurface(std::int32_t width, std::int32_t height)
+	{
+		if (!_initialized || _context == nullptr) {
+			return false;
+		}
+		width = std::clamp(width, 1, DisplayWidth);
+		height = std::clamp(height, 1, DisplayHeight);
+		if (width == _screenWidth && height == _screenHeight) {
+			return true;
+		}
+
+		_currentRenderTarget = nullptr;
+		FinishScene();
+		sceGxmFinish(_context);
+		const std::int32_t previousWidth = _screenWidth;
+		const std::int32_t previousHeight = _screenHeight;
+		DestroyScreenSurface();
+
+		auto create = [](std::int32_t surfaceWidth, std::int32_t surfaceHeight) {
+			SceGxmRenderTargetParams params = {};
+			params.width = surfaceWidth;
+			params.height = surfaceHeight;
+			params.scenesPerFrame = 8;
+			params.multisampleMode = SCE_GXM_MULTISAMPLE_NONE;
+			params.driverMemBlock = GxmMemory::InvalidUid;
+			return sceGxmCreateRenderTarget(&params, &_screenRenderTarget) >= 0 && CreateFrameSurfaceSlots(surfaceWidth, surfaceHeight);
+		};
+		if (create(width, height)) {
+			_screenWidth = width;
+			_screenHeight = height;
+			LOGI("Screen surface resized to {}x{}", width, height);
+			return true;
+		}
+
+		DestroyScreenSurface();
+		if (create(previousWidth, previousHeight)) {
+			_screenWidth = previousWidth;
+			_screenHeight = previousHeight;
+		}
+		LOGE("Cannot resize screen surface to {}x{}", width, height);
+		return false;
+	}
+
 	void GxmDevice::PresentFrame()
 	{
 		_telemetry.Presents++;
@@ -1671,10 +1937,13 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		// display controller will pick up next
 		_currentRenderTarget = nullptr;
 		FinishScene();
+		FrameSurfaceSlot& frameSurfaces = _frameSurfaceSlots[_currentFrameSlot];
+		WaitForPendingScene(frameSurfaces.ScreenBuffer.Base, WaitReason::Present, "Present", "Present");
 
+		SceGxmNotification* frameNotification = nullptr;
 		if (_presentVertexProgram != nullptr && _presentFragmentProgram != nullptr && EnsureSequentialIndices(4)) {
 			const std::int32_t result = sceGxmBeginScene(_context, 0, _displayRenderTarget, nullptr, nullptr,
-				_displaySyncObjects[_backBufferIndex], &_displaySurfaces[_backBufferIndex], &_depthSurface);
+				_displaySyncObjects[_backBufferIndex], &_displaySurfaces[_backBufferIndex], &frameSurfaces.DepthSurface);
 			if (result >= 0) {
 				sceGxmSetViewport(_context, float(DisplayWidth) * 0.5f, float(DisplayWidth) * 0.5f,
 					float(DisplayHeight) * 0.5f, float(DisplayHeight) * 0.5f, 0.5f, 0.5f);
@@ -1684,10 +1953,13 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 				sceGxmSetCullMode(_context, SCE_GXM_CULL_NONE);
 				SetDepthStateBothFaces(SCE_GXM_DEPTH_FUNC_ALWAYS, SCE_GXM_DEPTH_WRITE_DISABLED);
 				SetFragmentProgramEnabledBothFaces(SCE_GXM_FRAGMENT_PROGRAM_ENABLED);
-				sceGxmSetFragmentTexture(_context, 0, &_screenTexture);
+				sceGxmSetFragmentTexture(_context, 0, &frameSurfaces.ScreenTexture);
 				sceGxmSetVertexStream(_context, 0, _presentVertices.Base);
 				sceGxmDraw(_context, SCE_GXM_PRIMITIVE_TRIANGLE_STRIP, SCE_GXM_INDEX_FORMAT_U16, _sequentialIndices.Base, 4);
-				sceGxmEndScene(_context, nullptr, nullptr);
+				frameNotification = &_frameNotifications[_nextFrameNotificationSlot];
+				frameNotification->value++;
+				sceGxmEndScene(_context, nullptr, frameNotification);
+				_nextFrameNotificationSlot = (_nextFrameNotificationSlot + 1) % FrameNotificationSlotCount;
 			} else {
 				LOGE("sceGxmBeginScene(present) failed with 0x{:.8x}", std::uint32_t(result));
 			}
@@ -1718,6 +1990,23 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 		sceGxmFinish(_context);
 		const std::uint64_t finishMicroseconds = sceKernelGetProcessTimeWide() - finishStart;
 		_telemetry.FinishMicroseconds += finishMicroseconds;
+		if (frameNotification != nullptr) {
+			_telemetry.FrameNotificationChecks++;
+			if (*frameNotification->address != frameNotification->value) {
+				_telemetry.FrameNotificationFailures++;
+			}
+		}
+		for (PendingScene& pendingScene : _pendingScenes) {
+			// sceGxmFinish() completed every producer, so keeping this slot active would only add a redundant wait
+			// when the next frame reuses it.
+			pendingScene.Active = false;
+			pendingScene.SurfaceData = nullptr;
+			pendingScene.Program = nullptr;
+			pendingScene.TargetLabel[0] = '\0';
+			pendingScene.TargetId = 0;
+			pendingScene.Width = 0;
+			pendingScene.Height = 0;
+		}
 		if (_lastFinishedSceneProgram != nullptr) {
 			for (Telemetry::ShaderDraw& draw : _telemetry.ShaderDraws) {
 				if (draw.ProgramName != nullptr && std::strcmp(draw.ProgramName, _lastFinishedSceneProgram) == 0) {
@@ -1729,6 +2018,10 @@ float4 main(float2 vTexCoords : TEXCOORD0) : COLOR
 
 		// Everything recorded this frame has been consumed, so anything a growing buffer displaced can go
 		ReleaseRetiredBlocks();
+
+		_currentFrameSlot = (_currentFrameSlot + 1) % FrameSlotCount;
+		_context = _contextSlots[_currentFrameSlot].Context;
+		_telemetry.ContextSlotRotations++;
 
 		_frontBufferIndex = _backBufferIndex;
 		_backBufferIndex = (_backBufferIndex + 1) % DisplayBufferCount;

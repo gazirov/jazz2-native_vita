@@ -25,7 +25,7 @@ namespace Jazz2::Rendering
 		if (notInitialized) {
 			_target = std::make_unique<Texture>(nullptr, Texture::ColorTargetFormat, width, height);
 			_target->SetWrap(SamplerWrapping::ClampToEdge);
-			_view = std::make_unique<Viewport>(_target.get(), Viewport::DepthStencilFormat::None);
+			_view = std::make_unique<Viewport>("Blur", _target.get(), Viewport::DepthStencilFormat::None);
 			_view->SetRootNode(this);
 			_view->SetCamera(_camera.get());
 			//_view->setClearMode(Viewport::ClearMode::Never);

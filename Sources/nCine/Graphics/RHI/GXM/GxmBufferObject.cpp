@@ -4,6 +4,7 @@
 #include "../../../../Main.h"
 
 #include <cstring>
+#include <limits>
 
 namespace nCine::RHI::GXM
 {
@@ -16,6 +17,8 @@ namespace nCine::RHI::GXM
 
 	GxmBufferObject::~GxmBufferObject()
 	{
+		// A submitted scene can still fetch this store after its owner is destroyed.
+		GxmDevice::WaitForGpuIdle();
 		GxmMemory::Free(_gpuBlock);
 		_data = nullptr;
 		_size = 0;
@@ -38,9 +41,14 @@ namespace nCine::RHI::GXM
 		if (size <= _size && _data != nullptr) {
 			return;
 		}
+		if (size > std::numeric_limits<std::uint32_t>::max()) {
+			LOGE("Cannot allocate {} bytes for a GPU buffer: sceGxm allocations are limited to 32-bit sizes", size);
+			return;
+		}
 
 		// A store the GPU reads has to be a mapped memory block. Growing means a fresh block: the pipeline's
 		// ring buffers size themselves once at startup, so this is not a per-frame path
+		GxmDevice::WaitForGpuIdle();
 		GxmMemory::Free(_gpuBlock);
 		const char* name = (_target == BufferTarget::Index ? "Jazz2:IndexBuffer"
 			: (_target == BufferTarget::Uniform ? "Jazz2:UniformBuffer" : "Jazz2:VertexBuffer"));
@@ -73,7 +81,7 @@ namespace nCine::RHI::GXM
 
 	void GxmBufferObject::BufferSubData(std::size_t offset, std::size_t size, const void* data)
 	{
-		if (data == nullptr || _data == nullptr || offset + size > _size) {
+		if (data == nullptr || _data == nullptr || offset > _size || size > _size - offset) {
 			return;
 		}
 		std::memcpy(_data + offset, data, size);
@@ -92,7 +100,7 @@ namespace nCine::RHI::GXM
 
 	void GxmBufferObject::BindBufferRange(std::uint32_t index, std::size_t offset, std::size_t size)
 	{
-		if (_data == nullptr || offset + size > _size) {
+		if (_data == nullptr || size > std::numeric_limits<std::uint32_t>::max() || offset > _size || size > _size - offset) {
 			return;
 		}
 		GxmDevice::BindUniformRange(index, _data + offset, std::uint32_t(size));
@@ -101,7 +109,7 @@ namespace nCine::RHI::GXM
 	void* GxmBufferObject::MapBufferRange(std::size_t offset, std::size_t length, MapFlags access)
 	{
 		static_cast<void>(access);
-		if (_data == nullptr || offset + length > _size) {
+		if (_data == nullptr || offset > _size || length > _size - offset) {
 			return nullptr;
 		}
 		return _data + offset;
